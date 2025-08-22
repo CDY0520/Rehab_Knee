@@ -205,3 +205,22 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# IDE
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+
+# Data (원본/대용량은 추적 제외)
+data/raw/
+data/processed/
+results/figures/
+results/reports/*.pdf
+
+# OS
+.DS_Store
+Thumbs.db
+
