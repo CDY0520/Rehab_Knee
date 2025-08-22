@@ -1,0 +1,5 @@
+[project]
+name = "rehab-knee"
+version = "0.1.0"
+description = "Mediapipe + Python 기반 무릎 재활 분석 데모"
+requires-python = ">=3.12,<3.13"
