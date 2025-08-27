@@ -6,35 +6,28 @@
      - 무릎 지표: 과신전, 정렬(내반/외반 편차), swing 최대 굴곡, stance:swing 비·좌우차
      - 발목 지표: dorsiflexion/plantarflexion, toe clearance, inversion/eversion, HS 순간 발각도
 
+발목 각도 계산: atan2 기반 부호 각도(개선)
+ - Shank(Knee→Ankle) vs Foot(Ankle→Toe)의 부호 있는 상대각
+ - Dorsiflexion(발등굽힘) = +, Plantarflexion(발바닥굽힘) = -
+ - LEFT=+1, RIGHT=-1 로 side_sign으로 좌우 반전 제어
+ - summarize_ankle_metrics()에서 중립(stance 중앙값) 보정 후 ROM/최대치 계산
+
 블록 구성
  0) 라이브러리 임포트
  1) 상수(정상 범위/이상 기준)와 타입
  2) 기하 유틸(벡터·각도·시계열 추출)
  3) 공통 지표(ROM/피크 등)
  4) 무릎 지표 함수
- 5) 발목 지표 함수
+ 5) 발목 지표 함수  ← ★ 부호 각도 시리즈/요약 로직 + 중립 보정
  6) 리포트 헬퍼(요약 dict 생성)
  7) (옵션) 셀프테스트
 
-사용 방법
- 1) 프레임 포맷(JSON 예)
-    {
-      "fps": 30,
-      "frames": [
-        {"index":0, "landmarks":{"LEFT_HIP":[x,y,z,v], "LEFT_KNEE":[...], ...}},
-        ...
-      ]
-    }
- 2) events.py에서 생성한 stance/swing 마스크, HS/TO 인덱스를 함께 사용하면
-    표 기준(stance/swing/TO 근방 등)으로 지표를 안정적으로 계산할 수 있다.
-
 주의
  - 이 코드는 2D 화면 좌표 기반 근사(임상 절대각과 다를 수 있음). 동일 세팅 내 추이 비교에 우선 사용.
- - 도 단위 각도 기준: 무릎/발목의 “중립”을 180°(직선)로 가정한 단순 근사.
-
-참고
- - Mediapipe Pose Landmarks: https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker
+ - (참고) 이전 버전의 발목각은 180° 중립 기반이었으나, 현재는 부호 각도 기반으로 요약을 계산한다.
 """
+
+SIGNATURE = "metrics::signed_v1_neutralized"
 
 # 0) 라이브러리 임포트 ---------------------------------------------------
 from typing import Dict, List, Tuple, Literal, Optional
@@ -47,7 +40,7 @@ Joint = Literal[
     "RIGHT_HIP","RIGHT_KNEE","RIGHT_ANKLE","RIGHT_HEEL","RIGHT_FOOT_INDEX"
 ]
 
-DEG_NEUTRAL = 180.0  # 관절각 중립(직선) 근사
+DEG_NEUTRAL = 180.0  # 관절각 중립(직선) 근사 (무릎/구식 발목 방식 참조용)
 
 NORMAL_KNEE = {
     "extension_allowance_deg": 5.0,     # 무릎 신전각: 0°±5° → 180° 기준으로 +5° 초과면 과신전
@@ -113,14 +106,12 @@ def time_series_angle(frames: List[Dict], a: Joint, b: Joint, c: Joint,
         ok = False
         if lm and (a in lm and b in lm and c in lm):
             A4, B4, C4 = lm[a], lm[b], lm[c]
-            # visibility 체크(인덱스 3)
             if (len(A4) >= 4 and len(B4) >= 4 and len(C4) >= 4 and
                 A4[3] >= vis_thr and B4[3] >= vis_thr and C4[3] >= vis_thr):
                 A = _proj_xy(A4); B = _proj_xy(B4); C = _proj_xy(C4)
                 ang = angle_3pt(A, B, C)
                 last = ang
                 ok = True
-        # ok면 방금 계산, 아니면 last 유지
         out.append(last if not ok else last)
     return out
 
@@ -144,6 +135,50 @@ def foot_axis_angle_series(frames: List[Dict], side: Literal["LEFT","RIGHT"]) ->
         T = _proj_xy(f["landmarks"][tip])
         out.append(line_angle_xy(H, T))
     return out
+
+# === (NEW) 발목 부호 각도 유틸 ============================================
+def _angle_deg_from_vec2(v):
+    """2D 벡터의 각도(도), atan2(dy, dx)"""
+    return math.degrees(math.atan2(v[1], v[0]))
+
+def _signed_angle_between_2d(v1, v2) -> float:
+    """
+    두 2D 벡터 v1(기준: shank), v2(대상: foot)의 부호 있는 각도 차(도).
+    결과: [-180, 180], 반시계 +
+    """
+    a1 = _angle_deg_from_vec2((v1[0], v1[1]))
+    a2 = _angle_deg_from_vec2((v2[0], v2[1]))
+    d  = (a2 - a1 + 180) % 360 - 180
+    return d
+
+def ankle_signed_series(frames: List[Dict], side: Literal["LEFT","RIGHT"], vis_thr: float=0.4) -> List[float]:
+    """
+    Shank(Knee→Ankle) vs Foot(Ankle→Toe) 부호 각도 시계열.
+    - Dorsiflexion = +, Plantarflexion = -
+    - LEFT=+1, RIGHT=-1 로 좌우 부호 반전
+    - 가시성 낮을 때는 forward-fill (초기 0.0)
+    """
+    knee = f"{side}_KNEE"; ank = f"{side}_ANKLE"; toe = f"{side}_FOOT_INDEX"
+    side_sign = +1 if side == "LEFT" else -1
+    out: List[float] = []
+    last = 0.0
+    for f in frames:
+        lm = f.get("landmarks", {})
+        ok = False
+        if (knee in lm and ank in lm and toe in lm):
+            K4, A4, T4 = lm[knee], lm[ank], lm[toe]
+            if (len(K4)>=4 and len(A4)>=4 and len(T4)>=4 and
+                K4[3] >= vis_thr and A4[3] >= vis_thr and T4[3] >= vis_thr):
+                K = _proj_xy(K4); A = _proj_xy(A4); T = _proj_xy(T4)
+                shank = (A[0]-K[0], A[1]-K[1], 0.0)
+                foot  = (T[0]-A[0], T[1]-A[1], 0.0)
+                if (shank[0] != 0 or shank[1] != 0) and (foot[0] != 0 or foot[1] != 0):
+                    deg = _signed_angle_between_2d(shank, foot)
+                    last = side_sign * deg
+                    ok = True
+        out.append(last if not ok else last)
+    return out
+# ========================================================================
 
 # 3) 공통 지표(ROM/피크 등) ----------------------------------------------
 def range_of_motion(series: List[float]) -> float:
@@ -223,8 +258,9 @@ def stance_swing_lr_diff(left_mask: List[bool], right_mask: List[bool],
             "abs_diff_pp": diff, "is_asymmetric": 1.0 if diff > allow_pp else 0.0}
 
 # 5) 발목 지표 함수 --------------------------------------------------------
+# (참고) 아래 3개는 구식(180° 중립 방식) — 유지만 하고 요약에서는 미사용
 def ankle_angles_series(frames: List[Dict], side: Literal["LEFT","RIGHT"]) -> List[float]:
-    """발목(무릎-발목-발끝) 각도 시계열"""
+    """(구식) 발목(무릎-발목-발끝) 각도 시계열 — 180° 중립 기반"""
     hip   = f"{side}_KNEE"   # (주의) 발목 각에는 'KNEE-ANKLE-FOOT_INDEX' 사용
     ankle = f"{side}_ANKLE"
     foot  = f"{side}_FOOT_INDEX"
@@ -239,12 +275,7 @@ def ankle_angles_series(frames: List[Dict], side: Literal["LEFT","RIGHT"]) -> Li
 def ankle_dorsiflexion_max(ankle_deg: List[float],
                            swing_mask: Optional[List[bool]]=None,
                            min_normal_deg: float = NORMAL_ANKLE["dorsi_min_deg"]) -> Dict[str, float]:
-    """
-    Dorsiflexion 최대(근사):
-    - 중립 180°보다 '얼마나 작아졌는가'가 dorsiflexion 양.
-      dorsi_amt = 180 - 각도  (양수일수록 dorsiflexion)
-    - swing phase에서의 최대값 사용(없으면 전체).
-    """
+    """(구식) Dorsiflexion 최대(근사) — 새 요약 경로에서는 미사용"""
     if not ankle_deg: return {"dorsi_max_deg": 0.0, "is_insufficient": 1.0}
     seq = [v for i,v in enumerate(ankle_deg) if (not swing_mask) or swing_mask[i]]
     if not seq: seq = ankle_deg
@@ -254,11 +285,7 @@ def ankle_dorsiflexion_max(ankle_deg: List[float],
 def ankle_plantarflexion_push_off(ankle_deg: List[float],
                                   stance_mask: Optional[List[bool]]=None,
                                   min_normal_deg: float = NORMAL_ANKLE["plantar_min_deg"]) -> Dict[str, float]:
-    """
-    Push-off 시 plantarflexion 최대(근사):
-    - plantar_amt = 각도 - 180  (양수일수록 plantarflexion)
-    - stance phase에서의 최대값 사용(없으면 전체).
-    """
+    """(구식) Push-off plantarflexion 최대(근사) — 새 요약 경로에서는 미사용"""
     if not ankle_deg: return {"plantar_max_deg": 0.0, "is_insufficient": 1.0}
     seq = [v for i,v in enumerate(ankle_deg) if (not stance_mask) or stance_mask[i]]
     if not seq: seq = ankle_deg
@@ -311,7 +338,7 @@ def inversion_eversion_flags(tilt_deg: List[float],
     - 평균 절대 기울기와 최대 절대 기울기 계산
     - 최대값 > risk_deg 이 오래 지속될 경우 위험(여기선 단순히 최대값 기준)
     """
-    if not tilt_deg: return {"mean_abs_deg": 0.0, "max_abs_deg": 0.0, "is_excessive": 0.0}
+    if not tilt_deg: return {"mean_abs_deg": 0.0, "max_abs_deg": 0.0, "is_excessive": 0.0, "is_outside_norm_mean": 0.0}
     abs_vals = [abs(x) for x in tilt_deg]
     mean_abs = statistics.mean(abs_vals)
     mx = max(abs_vals)
@@ -361,35 +388,62 @@ def summarize_ankle_metrics(frames: List[Dict], side: Literal["LEFT","RIGHT"],
                             swing_mask: Optional[List[bool]]=None,
                             pelvis_y: Optional[List[float]]=None,
                             scale_cm_per_unit: Optional[float]=None) -> Dict[str, float]:
-    """발목 지표 요약 생성"""
-    ank_deg = ankle_angles_series(frames, side)
-    foot_angle = time_series_angle(frames, f"{side}_ANKLE", f"{side}_HEEL", f"{side}_FOOT_INDEX")
-    _, toe_y = series_xy(frames, f"{side}_FOOT_INDEX")
+    """
+    발목 지표 요약 생성 (★ 부호 각도 + 중립 보정):
+      - series = ankle_signed_series(): Dorsi + / Plantar -
+      - 중립 = stance 구간 중앙값(있으면) or 전체 중앙값
+      - 보정 시계열 ank0 = series - 중립
+      - ROM = max(ank0) - min(ank0)
+      - dorsi_max = max(ank0), plantar_max = abs(min(ank0))
+    """
+    # --- 부호 각도 시리즈 ---
+    ank_signed = ankle_signed_series(frames, side)
 
-    dorsi = ankle_dorsiflexion_max(ank_deg, swing_mask)
-    plantar = ankle_plantarflexion_push_off(ank_deg, stance_mask)
-    clr = toe_clearance_min(toe_y, pelvis_y, scale_cm_per_unit)
-    tilt = inversion_eversion_series(frames, side)
-    tilt_flag = inversion_eversion_flags(tilt)
+    # --- 중립(0) 보정: stance 중앙값 우선 ---
+    if ank_signed:
+        if stance_mask and any(stance_mask) and len(stance_mask) == len(ank_signed):
+            stance_vals = [v for v, m in zip(ank_signed, stance_mask) if m]
+            neutral = statistics.median(stance_vals) if stance_vals else statistics.median(ank_signed)
+        else:
+            neutral = statistics.median(ank_signed)
+        ank0 = [v - neutral for v in ank_signed]
+    else:
+        ank0 = []
+
+    # --- 요약값(보정 시계열 기준) ---
+    dorsi_max   = max(ank0) if ank0 else 0.0            # + (발등 굽힘)
+    plantar_min = min(ank0) if ank0 else 0.0            # - (발바닥 굽힘)
+    ankle_rom   = (dorsi_max - plantar_min) if ank0 else 0.0
+
+    # 임상 임계값 플래그 (선택적)
+    dorsi_flag   = 1.0 if dorsi_max   < NORMAL_ANKLE["dorsi_min_deg"]   else 0.0
+    plantar_flag = 1.0 if abs(plantar_min) < NORMAL_ANKLE["plantar_min_deg"] else 0.0
+
+    # --- 보조 지표(그대로 유지) ---
+    foot_angle = time_series_angle(frames, f"{side}_ANKLE", f"{side}_HEEL", f"{side}_FOOT_INDEX")
+    _, toe_y   = series_xy(frames, f"{side}_FOOT_INDEX")
+    clr        = toe_clearance_min(toe_y, pelvis_y, scale_cm_per_unit)
+    tilt       = inversion_eversion_series(frames, side)
+    tilt_flag  = inversion_eversion_flags(tilt)
 
     return {
-        "ankle_rom_deg": range_of_motion(ank_deg),
-        "dorsi_max_deg": dorsi["dorsi_max_deg"],
-        "dorsi_insufficient_flag": dorsi["is_insufficient"],
-        "plantar_max_deg": plantar["plantar_max_deg"],
-        "plantar_insufficient_flag": plantar["is_insufficient"],
+        "ankle_rom_deg": round(ankle_rom, 2),
+        "dorsi_max_deg": round(dorsi_max, 2),
+        "plantar_max_deg": round(abs(plantar_min), 2),
+        "dorsi_insufficient_flag": dorsi_flag,
+        "plantar_insufficient_flag": plantar_flag,
         "toe_clearance_min": clr["min_clearance"],   # scale 주면 cm
         "toe_clearance_low_flag": clr["is_low"] if scale_cm_per_unit else 0.0,
         "inv_evert_mean_abs_deg": tilt_flag["mean_abs_deg"],
         "inv_evert_max_abs_deg": tilt_flag["max_abs_deg"],
         "inv_evert_excessive_flag": tilt_flag["is_excessive"],
         "inv_evert_outside_norm_mean_flag": tilt_flag["is_outside_norm_mean"],
-        # 참조용: HS 순간 발각도는 events.py의 HS 인덱스를 입력해 heel_strike_foot_angle()로 별도 호출
+        # 참고: HS 순간 발각도는 events.py의 HS 인덱스를 입력해 heel_strike_foot_angle()로 별도 계산
     }
 
 # 7) (옵션) 셀프테스트 ------------------------------------------------------
 if __name__ == "__main__":
-    # 아주 짧은 가짜 프레임 5개로 동작만 확인 (실제 값은 의미 없음)
+    # 아주 짧은 가짜 프레임 50개로 동작만 확인 (실제 값은 의미 없음)
     frames = []
     for i in range(50):
         # 좌측 랜드마크(단순 파형)

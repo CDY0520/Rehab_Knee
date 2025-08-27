@@ -6,7 +6,7 @@
 블록 구성
  0) 라이브러리 임포트
  1) 시계열 유틸(배열 변환, 미분/속도, 이동평균/평활)
- 2) 보행 이벤트 검출: heel strike(HS), toe off(TO)
+ 2) 보행 이벤트 검출: heel strike(HS), toe off(TO), (NEW) hybrid FS fallback
  3) stance/swing 마스크 생성
  4) 운동 이벤트: 관절각 시계열 기반 rep 카운트(peak↔valley)
  5) (옵션) 셀프테스트용 메인
@@ -19,6 +19,7 @@
 출력
  - HS/TO 인덱스 리스트
  - stance/swing boolean 마스크
+ - (NEW) 하이브리드 FS 이벤트(Event("FS", frame, time_s)) 리스트
  - (rep_count, rep_starts, rep_ends)
 
 참고
@@ -27,7 +28,11 @@
 
 # 0) 라이브러리 임포트 ---------------------------------------------------
 from typing import List, Tuple
+from collections import namedtuple
 import numpy as np
+
+# 이벤트 구조체 (type: "FS"/"HS"/"TO" 등, frame, time_s)
+Event = namedtuple("Event", ["type", "frame", "time_s"])
 
 # 1) 시계열 유틸 ----------------------------------------------------------
 def _series(arr_like) -> np.ndarray:
@@ -135,6 +140,57 @@ def detect_toe_off(foot_index_y: List[float], fps: float,
                     to.append(cand)
     return to
 
+# --- (NEW) Hybrid FS detector (front/side 공통 fallback) ------------------
+def detect_steps_hybrid(knee_deg_series: List[float],
+                        ankle_y_series: List[float],
+                        fps: float,
+                        min_gap_ms: int = 300,
+                        w_smooth: int = 7) -> List[Event]:
+    """
+    하이브리드 FS(≈ foot strike) 탐지:
+    - 소스1(무릎각): peak → 다음 trough 구간의 trough를 FS 후보로 사용
+    - 소스2(발목 y): y의 국소 최소(지면 접촉 근방)를 FS 후보로 사용
+    - 두 소스를 병합하고 최소 간격(min_gap_ms)로 중복 제거
+
+    반환: [Event("FS", frame, time_s), ...]
+    """
+    k = moving_average(knee_deg_series, k=w_smooth)
+    a = moving_average(ankle_y_series, k=w_smooth)
+    n = len(k)
+
+    # --- 소스1: 무릎각에서 peak/trough 추출 ---
+    peaks   = local_maxima_idx(k, win=2)
+    troughs = local_minima_idx(k, win=2)
+
+    fs_from_knee = []
+    troughs_np = np.array(troughs, dtype=int)
+    last = -10**9
+    refractory = int((min_gap_ms/1000.0) * fps)
+
+    for p in peaks:
+        # peak 이후 가장 가까운 trough 선택
+        aft = troughs_np[troughs_np > p]
+        if aft.size == 0:
+            continue
+        t = int(aft[0])
+        if t - last >= refractory:
+            fs_from_knee.append(t)
+            last = t
+
+    # --- 소스2: 발목 y의 국소 최소 ---
+    fs_from_ankle = local_minima_idx(a, win=2)
+
+    # --- 병합/정렬/간격 필터 ---
+    all_cands = sorted(fs_from_knee + fs_from_ankle)
+    merged = []
+    last = -10**9
+    for f in all_cands:
+        if f - last >= refractory:
+            merged.append(int(f))
+            last = f
+
+    return [Event("FS", f, f/float(fps)) for f in merged]
+
 # 3) stance/swing 마스크 ---------------------------------------------------
 def stance_swing_masks(num_frames: int, hs_indices: List[int], to_indices: List[int]) -> Tuple[List[bool], List[bool]]:
     """
@@ -215,22 +271,27 @@ def count_reps_from_angle(angle_deg: List[float], fps: float,
 
 # 5) (옵션) 셀프테스트 ------------------------------------------------------
 if __name__ == "__main__":
-    # 가짜 파형으로 HS/TO/rep 동작을 대략 확인
+    # 가짜 파형으로 HS/TO/rep/FS 동작을 대략 확인
     fps = 30.0
     t = np.linspace(0, 6, int(6*fps))
-    # 발끝/힐 y 파형(사인 + 잡음) — 단지 동작 확인용
+
+    # 발목/힐/발끝 y 파형(사인 + 잡음) — 단지 동작 확인용
     heel_y = 0.5 + 0.1*np.sin(2*np.pi*1.2*t) + 0.01*np.random.randn(t.size)
+    ankle_y = 0.5 + 0.1*np.sin(2*np.pi*1.2*t + np.pi/6) + 0.01*np.random.randn(t.size)
     toe_y  = 0.5 + 0.1*np.sin(2*np.pi*1.2*t + np.pi/2) + 0.01*np.random.randn(t.size)
 
     hs = detect_heel_strike(heel_y.tolist(), fps)
     to = detect_toe_off(toe_y.tolist(), fps)
     stance, swing = stance_swing_masks(len(t), hs, to)
 
-    # 각도 파형(굴곡↔신전) — rep 테스트용
+    # 각도 파형(굴곡↔신전) — rep/FS 테스트용
     knee = 160 - 25*np.sin(2*np.pi*0.6*t) + 1.5*np.random.randn(t.size)
+    fs_events = detect_steps_hybrid(knee.tolist(), ankle_y.tolist(), fps, min_gap_ms=300, w_smooth=7)
+
     rc, rs, re = count_reps_from_angle(knee.tolist(), fps, min_rep_sec=0.8, prominence=6)
 
     print(f"[HS] {hs[:5]} ... (총 {len(hs)})")
     print(f"[TO] {to[:5]} ... (총 {len(to)})")
     print(f"[stance %] {round(100*sum(stance)/len(stance),1)} / [swing %] {round(100*sum(swing)/len(swing),1)}")
+    print(f"[FS] {len(fs_events)} events, first 3 = {fs_events[:3]}")
     print(f"[rep] count={rc}, starts={rs[:3]}, ends={re[:3]}")

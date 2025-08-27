@@ -18,6 +18,7 @@
 사용 예시
  1) 보행:
     python run_analysis.py --task gait --side LEFT --save-annot
+    python run_analysis.py --task gait --side LEFT --tstart 50 --tend 70 --save-annot
  2) STS:
     python run_analysis.py --task sts --side LEFT --save-annot
  3) 운동:
@@ -40,26 +41,34 @@ import mediapipe as mp
 try:
     # src/config.py가 있으면 우선 사용
     from src import config as CFG
-    SAMPLES_DIR = getattr(CFG, "SAMPLES_DIR", "samples")
+    SAMPLES_DIR = getattr(CFG, "SAMPLES_DIR", "data/samples")
     RESULTS_JSON_DIR = getattr(CFG, "RESULTS_JSON_DIR", "results/json")
     RESULTS_FIG_DIR = getattr(CFG, "RESULTS_FIG_DIR", "results/figures")
 except Exception:
     # 없으면 기본값
-    SAMPLES_DIR = "samples"
+    SAMPLES_DIR = "data/samples"
     RESULTS_JSON_DIR = "results/json"
     RESULTS_FIG_DIR = "results/figures"
 
+# metrics / events 임포트 ---------------------------------------------------
 from src.metrics import (
     time_series_angle, series_xy, range_of_motion,
     summarize_knee_metrics, summarize_ankle_metrics
 )
+# 선택 디버그: 현재 metrics 파일이 실제로 로드됐는지 서명 찍기(없으면 조용히 패스)
+try:
+    from src.metrics import SIGNATURE as METRICS_SIGNATURE
+    print("[DEBUG] metrics signature =", METRICS_SIGNATURE)
+except Exception:
+    pass
+
 from src.events import (
-    detect_heel_strike, detect_toe_off, stance_swing_masks, count_reps_from_angle
+    detect_heel_strike, detect_toe_off, stance_swing_masks, count_reps_from_angle,
+    detect_steps_hybrid,  # 하이브리드 FS
 )
 
 # 1) 경로/환경 유틸 --------------------------------------------------------
-# 스크립트 기준 절대경로 변환
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent  # 스크립트 기준 절대경로 변환용 베이스
 
 def resolve_path(p: str) -> str:
     """스크립트 위치(BASE_DIR) 기준 절대경로로 변환"""
@@ -80,6 +89,7 @@ def must_exist(p: str, kind: str = "file"):
         )
 
 def ensure_dir(path: str):
+    """출력 디렉토리 생성(존재하면 무시)"""
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
 def default_out_paths(video_path: str, task: str) -> Tuple[str, str]:
@@ -115,6 +125,7 @@ def rotate_frame(frame, rotate_deg: int):
         return cv2.warpAffine(frame, M, (w, h))
 
 def draw_text(img, text, xy=(10, 22), scale=0.6, color=(255,255,255)):
+    """영상 좌상단에 텍스트 2중 스트로크로 가독성 있게 표시"""
     cv2.putText(img, text, xy, cv2.FONT_HERSHEY_SIMPLEX, scale, (0,0,0), 3, cv2.LINE_AA)
     cv2.putText(img, text, xy, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
 
@@ -137,10 +148,13 @@ def process_video_to_frames(video_path: str,
                             flip: bool,
                             complexity: int,
                             save_annot: bool,
-                            annot_out_path: Optional[str]) -> Tuple[List[Dict], float]:
+                            annot_out_path: Optional[str],
+                            tstart: Optional[float] = None,
+                            tend: Optional[float] = None) -> Tuple[List[Dict], float]:
     """
     영상→프레임 루프→Pose 추정→frames(list[dict]) 생성.
     (save_annot=True면 주석 영상을 annot_out_path에 저장)
+    - tstart/tend(초): 지정 시 해당 구간만 분석(자르지 않고 내부적으로 시킹)
     반환: (frames, fps)
     """
     abs_video_path = resolve_path(video_path)
@@ -152,7 +166,6 @@ def process_video_to_frames(video_path: str,
     if not cap.isOpened():
         cap = cv2.VideoCapture(abs_video_path)
     if not cap.isOpened():
-        # 디버그: 확장자/파일크기/빌드정보
         try:
             size = os.path.getsize(abs_video_path)
         except Exception:
@@ -165,7 +178,22 @@ def process_video_to_frames(video_path: str,
             )
         )
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    # FPS/총길이 확보
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps <= 1e-6:
+        fps = 30.0  # 백업값
+    duration_ms = (cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps) * 1000.0
+
+    # 분석 구간(ms) 계산
+    start_ms = max(0.0, float(tstart) * 1000.0) if tstart is not None else 0.0
+    end_ms = float(tend) * 1000.0 if tend is not None else duration_ms
+    end_ms = min(end_ms, duration_ms)
+    if end_ms <= start_ms:
+        cap.release()
+        raise ValueError(f"[시간 구간 오류] tstart({tstart}) < tend({tend}) 이어야 합니다.")
+
+    # 시작 위치로 시크
+    cap.set(cv2.CAP_PROP_POS_MSEC, start_ms)
 
     writer = None
     if save_annot:
@@ -174,7 +202,7 @@ def process_video_to_frames(video_path: str,
     frames: List[Dict] = []
     idx = 0
     t0 = time.time()
-    last_lm = None # 마지막으로 성공한 랜드마크를 저장해서 forward-fill
+    last_lm = None  # 마지막으로 성공한 랜드마크를 저장해서 forward-fill
 
     with mp_pose.Pose(
         static_image_mode=False,
@@ -186,6 +214,11 @@ def process_video_to_frames(video_path: str,
     ) as pose:
 
         while True:
+            # 현재 위치가 end_ms 넘어가면 중단
+            cur_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+            if cur_ms > end_ms:
+                break
+
             ret, frame = cap.read()
             if not ret:
                 break
@@ -210,10 +243,8 @@ def process_video_to_frames(video_path: str,
                 last_lm = lm_dict
                 frames.append({"index": idx, "landmarks": lm_dict})
             else:
-                # 첫 유효 프레임이 나오기 전에는 건너뜀, 이후엔 마지막 값으로 유지
                 if last_lm is not None:
                     frames.append({"index": idx, "landmarks": last_lm})
-                # else: 아직 없는 경우는 스킵 (주석영상만 저장)
 
             # 주석 저장
             if save_annot:
@@ -228,7 +259,9 @@ def process_video_to_frames(video_path: str,
                         connection_drawing_spec=mp_drawing.DrawingSpec(color=(0,128,255), thickness=2)
                     )
                 disp_fps = (idx+1) / max(1e-6, (time.time()-t0))
+                rel_time = (start_ms + cur_ms - cap.get(cv2.CAP_PROP_POS_MSEC)) / 1000.0  # 표시용 보정은 단순화
                 draw_text(annot, f"{os.path.basename(abs_video_path)}  ~{disp_fps:4.1f} FPS", (10, 22))
+                draw_text(annot, f"t={cur_ms/1000.0:.2f}s  [{(start_ms/1000.0):.2f}~{(end_ms/1000.0):.2f}s]", (10, 44))
                 writer.write(annot)
 
             idx += 1
@@ -236,30 +269,53 @@ def process_video_to_frames(video_path: str,
     cap.release()
     if writer is not None:
         writer.release()
+
+    if len(frames) == 0:
+        raise RuntimeError("[오류] 유효 프레임이 생성되지 않았습니다. (포즈 미검출/구간설정/카메라 각도 확인)")
+
     return frames, float(fps)
 
 # 4) 과제별 분석 ------------------------------------------------------------
 def analyze_gait(frames: List[Dict], fps: float, side: Literal["LEFT","RIGHT"]) -> Dict:
+    """
+    보행 분석: HS/TO, stance/swing, 무릎·발목 요약 + 하이브리드 FS
+    """
+    # y축은 OpenCV 이미지 좌표(아래로 +)이므로 접촉 최소를 보기 위해 1.0 - y로 뒤집어 사용
     heel_y = [1.0 - f["landmarks"].get(f"{side}_HEEL", (0, 0, 0, 0))[1] for f in frames]
-    toe_y = [1.0 - f["landmarks"].get(f"{side}_FOOT_INDEX", (0, 0, 0, 0))[1] for f in frames]
+    toe_y  = [1.0 - f["landmarks"].get(f"{side}_FOOT_INDEX", (0, 0, 0, 0))[1] for f in frames]
 
-    hs = detect_heel_strike(heel_y, fps)
-    to = detect_toe_off(toe_y, fps)
+    # 1) 기본 HS/TO
+    hs = detect_heel_strike(heel_y, fps) if len(frames) > 3 else []
+    to = detect_toe_off(toe_y, fps) if len(frames) > 3 else []
     stance_mask, swing_mask = stance_swing_masks(len(frames), hs, to)
 
+    # 2) 무릎/발목 요약
     knee_sum  = summarize_knee_metrics(frames, side, stance_mask, swing_mask)
     ankle_sum = summarize_ankle_metrics(frames, side, stance_mask, swing_mask, scale_cm_per_unit=None)
+
+    # 3) 하이브리드 FS fallback (HS/TO가 빈약해도 최소 스텝 보조지표 제공)
+    hip  = f"{side}_HIP"; knee = f"{side}_KNEE"; ank = f"{side}_ANKLE"
+    knee_deg_series = time_series_angle(frames, hip, knee, ank)
+    _, ankle_y_series = series_xy(frames, ank)
+    fs_events = detect_steps_hybrid(knee_deg_series, ankle_y_series, fps, min_gap_ms=300, w_smooth=7)
+    fs_count = len(fs_events)
 
     return {
         "task": "gait",
         "side": side,
-        "events": {"heel_strike": hs, "toe_off": to},
+        "events": {
+            "heel_strike": hs,
+            "toe_off": to,
+            "fs_fallback": [{"type": e.type, "frame": e.frame, "time_s": e.time_s} for e in fs_events],
+        },
         "masks": {"stance": stance_mask, "swing": swing_mask},
         "knee_metrics": knee_sum,
-        "ankle_metrics": ankle_sum
+        "ankle_metrics": ankle_sum,
+        "fs_count": fs_count
     }
 
 def analyze_sts(frames: List[Dict], fps: float, side: Literal["LEFT","RIGHT"]) -> Dict:
+    """STS 분석: knee 각도로 간이 rep → 첫 rep 시간, ROM"""
     knee_deg = time_series_angle(frames, f"{side}_HIP", f"{side}_KNEE", f"{side}_ANKLE")
     rep_count, rep_starts, rep_ends = count_reps_from_angle(knee_deg, fps, min_rep_sec=0.8, prominence=6)
     duration_sec = 0.0
@@ -273,6 +329,7 @@ def analyze_sts(frames: List[Dict], fps: float, side: Literal["LEFT","RIGHT"]) -
     }
 
 def analyze_exercise(frames: List[Dict], fps: float, side: Literal["LEFT","RIGHT"]) -> Dict:
+    """운동(무릎 조절/스쿼트 등): knee 각도 기반 rep 카운트 + ROM"""
     knee_deg = time_series_angle(frames, f"{side}_HIP", f"{side}_KNEE", f"{side}_ANKLE")
     rep_count, rep_starts, rep_ends = count_reps_from_angle(knee_deg, fps, min_rep_sec=0.6, prominence=5)
     return {
@@ -284,18 +341,23 @@ def analyze_exercise(frames: List[Dict], fps: float, side: Literal["LEFT","RIGHT
 
 # 5) 저장/요약 --------------------------------------------------------------
 def save_json(obj, path: str):
+    """JSON 저장(UTF-8, 한글 깨짐 방지)"""
     ensure_dir(path)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
 def print_summary(result: Dict):
+    """콘솔 요약 출력(과제별 포맷)"""
     task = result["task"]
     print(f"\n=== SUMMARY ({task}) ===")
     if task == "gait":
         hs = len(result["events"]["heel_strike"])
         to = len(result["events"]["toe_off"])
+        fs = result.get("fs_count", 0)
         knee = result["knee_metrics"]; ankle = result["ankle_metrics"]
         print(f"HS n={hs}, TO n={to}")
+        if fs > 0:
+            print(f"(FS fallback) FS n={fs}")
         print(f"Knee ROM: {knee['knee_rom_deg']:.2f} deg | Hyperext: {int(knee['knee_hyperextension_flag'])} | Swing peak flex: {knee['knee_swing_peak_flex_deg']:.2f} deg")
         print(f"Ankle ROM: {ankle['ankle_rom_deg']:.2f} deg | Dorsi max: {ankle['dorsi_max_deg']:.2f} | Plantar max: {ankle['plantar_max_deg']:.2f}")
     elif task == "sts":
@@ -317,6 +379,9 @@ def main():
     ap.add_argument("--save-annot", action="store_true", help="주석 영상 저장 여부")
     ap.add_argument("--out-json", default=None, help="결과 JSON 저장 경로(미지정 시 기본 경로 사용)")
     ap.add_argument("--out-annot", default=None, help="주석 영상 저장 경로(미지정 시 기본 경로 사용)")
+    # (NEW) 분석 구간 옵션
+    ap.add_argument("--tstart", type=float, default=None, help="분석 시작 시각(초)")
+    ap.add_argument("--tend", type=float, default=None, help="분석 종료 시각(초)")
     args = ap.parse_args()
 
     # 출력 경로 기본값 생성(절대경로)
@@ -333,7 +398,9 @@ def main():
         flip=args.flip,
         complexity=args.complexity,
         save_annot=args.save_annot,
-        annot_out_path=annot_path
+        annot_out_path=annot_path,
+        tstart=args.tstart,
+        tend=args.tend
     )
 
     # 분석
