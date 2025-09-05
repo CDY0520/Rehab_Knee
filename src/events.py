@@ -1,297 +1,292 @@
 """
 파일명: src/events.py
-기능: 프레임별 포즈 좌표(특히 발/발끝 y, 관절각 시계열)를 이용해
-      보행 이벤트(Heel Strike, Toe Off), stance/swing 마스크, 운동 반복(rep)을 검출한다.
+ Mediapipe Pose 시계열(.npz)을 입력으로 보행(HS/MS/TO)·STS(Seat-off/Full-stand) 이벤트를 검출하고 지표를 계산한다.
+ 추가로 무릎/발목 핵심 지표(과신전, stiff-knee, toe-clearance)를 측면 영상 기준으로 산출한다.
 
 블록 구성
- 0) 라이브러리 임포트
- 1) 시계열 유틸(배열 변환, 미분/속도, 이동평균/평활)
- 2) 보행 이벤트 검출: heel strike(HS), toe off(TO), (NEW) hybrid FS fallback
- 3) stance/swing 마스크 생성
- 4) 운동 이벤트: 관절각 시계열 기반 rep 카운트(peak↔valley)
- 5) (옵션) 셀프테스트용 메인
+ 0) 임포트/상수: numpy, pandas(optional), pathlib, json, dataclass
+ 1) 공통 유틸: npz 로딩, 스무딩, 미분, 내보내기
+ 2) 보행 이벤트: HS/MS/TO 검출, 보행 지표 계산 + 무릎/발목 지표: 과신전(stance), stiff-knee(swing), toe-clearance(swing)
+ 3) STS 이벤트: seat-off, full-stand 검출 및 지표
+ 4) API: detect_gait_events / detect_sts_events / save_events_json / save_events_csv_timeline
 
-입력
- - fps: 초당 프레임
- - y시계열: HEEL_y, FOOT_INDEX_y 등 (MediaPipe 정규화 y; 화면 아래로 갈수록 값 증가)
- - angle_deg: 관절각 시계열(예: 무릎각; 도 단위)
-
-출력
- - HS/TO 인덱스 리스트
- - stance/swing boolean 마스크
- - (NEW) 하이브리드 FS 이벤트(Event("FS", frame, time_s)) 리스트
- - (rep_count, rep_starts, rep_ends)
-
-참고
- - 보행 이벤트 규칙은 측면 촬영 y축 기준 근사이며, 실제 촬영 세팅에 따라 임계값 튜닝 필요.
+사용 예
+ python -c "from src.events import detect_gait_events;print(detect_gait_events('results/keypoints/sample_walk.npz','left'))"
 """
 
-# 0) 라이브러리 임포트 ---------------------------------------------------
-from typing import List, Tuple
-from collections import namedtuple
+from __future__ import annotations
+import json
+from dataclasses import dataclass
+from pathlib import Path
 import numpy as np
 
-# 이벤트 구조체 (type: "FS"/"HS"/"TO" 등, frame, time_s)
-Event = namedtuple("Event", ["type", "frame", "time_s"])
+try:
+    import pandas as pd  # csv 내보내기 선택
+except Exception:
+    pd = None
 
-# 1) 시계열 유틸 ----------------------------------------------------------
-def _series(arr_like) -> np.ndarray:
-    """list/tuple 등을 float numpy array로 변환"""
-    return np.asarray(arr_like, dtype=float)
 
-def diff(series: List[float]) -> np.ndarray:
-    """1차 차분"""
-    s = _series(series)
-    if s.size == 0:
-        return s
-    d = np.zeros_like(s)
-    d[1:] = s[1:] - s[:-1]
-    return d
+# -------------------------------
+# 0) 상수(랜드마크 인덱스)
+# -------------------------------
+L_ANKLE, R_ANKLE = 27, 28
+L_FOOT_INDEX, R_FOOT_INDEX = 31, 32
+L_HIP, R_HIP = 23, 24
+L_KNEE, R_KNEE = 25, 26
+NOSE = 0
 
-def velocity(series: List[float], fps: float) -> np.ndarray:
-    """수직속도(근사) = 1차 차분 * fps"""
-    return diff(series) * float(fps)
 
-def moving_average(series: List[float], k: int=3) -> np.ndarray:
-    """간단 이동평균(홀수 권장). k<=1이면 원본 반환."""
-    s = _series(series)
-    if k <= 1 or s.size == 0:
-        return s
-    pad = k // 2
-    # 양끝 단순 패딩 후 컨볼루션
-    sp = np.pad(s, (pad, pad), mode='edge')
-    ker = np.ones(k, dtype=float) / k
-    return np.convolve(sp, ker, mode='valid')
+# -------------------------------
+# 파라미터
+# -------------------------------
+@dataclass
+class GaitParams:
+    ma_win: int = 5                    # 이동평균 창
+    min_step_interval_ms: int = 300    # HS 최소 간격
+    hs_prominence: float = 0.003       # 사용 안함(예비)
 
-def local_minima_idx(y: np.ndarray, win: int=2) -> List[int]:
-    """
-    국소 최소 인덱스 근사: 중심값이 좌/우 win 범위의 최소와 일치할 때.
-    (간단 근사이므로 잡음이 크면 moving_average로 먼저 평활 권장)
-    """
-    out = []
-    n = len(y)
-    for i in range(n):
-        s = max(0, i-win); e = min(n, i+win+1)
-        if y[i] == np.min(y[s:e]):
-            # 완전히 평평한 구간의 다중 인덱스 방지: 한 구간당 중앙값만 취함
-            if not out or i - out[-1] > win:
-                out.append(i)
-    return out
+@dataclass
+class STSParams:
+    ma_win: int = 7
+    min_cycle_ms: int = 1500
 
-def local_maxima_idx(y: np.ndarray, win: int=2) -> List[int]:
-    """국소 최대 인덱스 근사"""
-    out = []
-    n = len(y)
-    for i in range(n):
-        s = max(0, i-win); e = min(n, i+win+1)
-        if y[i] == np.max(y[s:e]):
-            if not out or i - out[-1] > win:
-                out.append(i)
-    return out
+@dataclass
+class KneeAnkleThresh:
+    hyperext_deg: float = 185.0   # 무릎 과신전: 무릎각 > 185°
+    stiff_knee_deg: float = 40.0  # swing 최대 굴곡 < 40°
+    toe_clear_min: float = 0.012  # 정규화 좌표 기준 최소 toe 상승량(≈1–1.5cm@1.2m)
 
-# 2) 보행 이벤트 검출 ------------------------------------------------------
-def detect_heel_strike(heel_y: List[float], fps: float,
-                       smooth_k: int=5, min_interval_ms: int=250) -> List[int]:
-    """
-    Heel Strike(HS) 검출(측면 세팅 가정):
-    - 힐 y의 수직속도가 (하강→상승)으로 부호 전환되는 근방에서
-      y가 국소 최소(local min)인 프레임을 HS로 가정.
-    - smooth_k: 이동평균 커널(잡음 완화), min_interval_ms: 연속 검출 방지 기간.
-    """
-    y_raw = _series(heel_y)
-    y = moving_average(y_raw, k=smooth_k)
-    vy = velocity(y, fps)
 
-    minima = set(local_minima_idx(y, win=2))
-    hs = []
-    refractory = int((min_interval_ms/1000) * fps)
+# -------------------------------
+# 1) 공통 유틸
+# -------------------------------
+def load_npz(path: str | Path):
+    d = np.load(path, allow_pickle=True)
+    lm_x, lm_y, lm_v = d["lm_x"], d["lm_y"], d["lm_v"]
+    t_ms = d["t_ms"]
+    valid = d["valid"].astype(bool)
+    meta = json.loads(str(d["meta"]))
+    return lm_x, lm_y, lm_v, t_ms, valid, meta
 
-    for i in range(1, len(y)-1):
-        # 속도 부호: 음수(내려감) -> 양수(올라감) 전환 지점
-        if vy[i-1] < 0 <= vy[i]:
-            # 해당 프레임이 local minimum 근처인지 확인
-            cand = min(range(max(0,i-2), min(len(y), i+3)), key=lambda k: abs(y[k]-y[i]))
-            if cand in minima:
-                if not hs or (cand - hs[-1] > refractory):
-                    hs.append(cand)
-    return hs
+def smooth1d(x: np.ndarray, win: int):
+    if win <= 1:
+        return x
+    k = np.ones(win, dtype=float) / win
+    return np.convolve(x, k, mode="same")
 
-def detect_toe_off(foot_index_y: List[float], fps: float,
-                   smooth_k: int=5, min_interval_ms: int=250) -> List[int]:
-    """
-    Toe Off(TO) 검출(측면 세팅 가정):
-    - 발끝 y의 수직속도가 (상승→하강)으로 전환되는 근방에서
-      y가 국소 최대(local max)인 프레임을 TO로 가정.
-    """
-    y_raw = _series(foot_index_y)
-    y = moving_average(y_raw, k=smooth_k)
-    vy = velocity(y, fps)
+def diff(x: np.ndarray, dt: float):
+    dx = np.zeros_like(x, dtype=float)
+    if len(x) > 1:
+        dx[1:-1] = (x[2:] - x[:-2]) / (2 * dt)
+        dx[0] = (x[1] - x[0]) / dt
+        dx[-1] = (x[-1] - x[-2]) / dt
+    return dx
 
-    maxima = set(local_maxima_idx(y, win=2))
-    to = []
-    refractory = int((min_interval_ms/1000) * fps)
+def _export_json(obj: dict, out: str | Path):
+    out = Path(out); out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
 
-    for i in range(1, len(y)-1):
-        # 속도 부호: 양수(올라감) -> 음수(내려감)
-        if vy[i-1] > 0 >= vy[i]:
-            cand = min(range(max(0,i-2), min(len(y), i+3)), key=lambda k: abs(y[k]-y[i]))
-            if cand in maxima:
-                if not to or (cand - to[-1] > refractory):
-                    to.append(cand)
-    return to
+def _export_csv(rows: list[dict], out: str | Path):
+    if pd is None:
+        return
+    out = Path(out); out.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(out, index=False, encoding="utf-8-sig")
 
-# --- (NEW) Hybrid FS detector (front/side 공통 fallback) ------------------
-def detect_steps_hybrid(knee_deg_series: List[float],
-                        ankle_y_series: List[float],
-                        fps: float,
-                        min_gap_ms: int = 300,
-                        w_smooth: int = 7) -> List[Event]:
-    """
-    하이브리드 FS(≈ foot strike) 탐지:
-    - 소스1(무릎각): peak → 다음 trough 구간의 trough를 FS 후보로 사용
-    - 소스2(발목 y): y의 국소 최소(지면 접촉 근방)를 FS 후보로 사용
-    - 두 소스를 병합하고 최소 간격(min_gap_ms)로 중복 제거
 
-    반환: [Event("FS", frame, time_s), ...]
-    """
-    k = moving_average(knee_deg_series, k=w_smooth)
-    a = moving_average(ankle_y_series, k=w_smooth)
-    n = len(k)
+# -------------------------------
+# 2) 보행 이벤트 + 무릎/발목 지표
+# -------------------------------
+def _knee_angle_deg(yx: np.ndarray, hip_i: int, knee_i: int, ankle_i: int) -> np.ndarray:
+    # yx: (N, 33, 2)  [y,x]
+    a = yx[:, hip_i] - yx[:, knee_i]
+    b = yx[:, ankle_i] - yx[:, knee_i]
+    num = (a * b).sum(axis=1)
+    den = np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1) + 1e-6
+    cos = np.clip(num / den, -1.0, 1.0)
+    return np.degrees(np.arccos(cos))
 
-    # --- 소스1: 무릎각에서 peak/trough 추출 ---
-    peaks   = local_maxima_idx(k, win=2)
-    troughs = local_minima_idx(k, win=2)
+def _side_indices(side_hint: str | None):
+    if str(side_hint).lower().startswith("l"):
+        return L_ANKLE, L_FOOT_INDEX, L_HIP, L_KNEE, L_ANKLE
+    if str(side_hint).lower().startswith("r"):
+        return R_ANKLE, R_FOOT_INDEX, R_HIP, R_KNEE, R_ANKLE
+    return L_ANKLE, L_FOOT_INDEX, L_HIP, L_KNEE, L_ANKLE
 
-    fs_from_knee = []
-    troughs_np = np.array(troughs, dtype=int)
-    last = -10**9
-    refractory = int((min_gap_ms/1000.0) * fps)
-
-    for p in peaks:
-        # peak 이후 가장 가까운 trough 선택
-        aft = troughs_np[troughs_np > p]
-        if aft.size == 0:
+def _cycle_segments(hs_idx: list[int], to_idx: list[int]) -> list[tuple[int,int,int]]:
+    segs = []
+    for i, h in enumerate(hs_idx[:-1]):
+        nxt = hs_idx[i + 1]
+        tos = [t for t in to_idx if h < t < nxt]
+        if not tos:
             continue
-        t = int(aft[0])
-        if t - last >= refractory:
-            fs_from_knee.append(t)
-            last = t
+        segs.append((h, tos[0], nxt))
+    return segs
 
-    # --- 소스2: 발목 y의 국소 최소 ---
-    fs_from_ankle = local_minima_idx(a, win=2)
+def _toe_clearance(ly: np.ndarray, toe_i: int, start: int, end: int) -> float:
+    seg = ly[start:end + 1, toe_i]
+    return float(seg[0] - np.min(seg))  # y는 아래로 커짐 → 시작-최소
 
-    # --- 병합/정렬/간격 필터 ---
-    all_cands = sorted(fs_from_knee + fs_from_ankle)
-    merged = []
-    last = -10**9
-    for f in all_cands:
-        if f - last >= refractory:
-            merged.append(int(f))
-            last = f
+def detect_gait_events(npz_path: str, side_hint: str | None = None, params: GaitParams | None = None) -> dict:
+    params = params or GaitParams()
+    lx, ly, lv, t_ms, valid, meta = load_npz(npz_path)
+    dt = np.median(np.diff(t_ms)) / 1000.0 if len(t_ms) > 1 else 1 / max(meta.get("fps", 30), 1)
 
-    return [Event("FS", f, f/float(fps)) for f in merged]
+    ankle_i, toe_i, hip_i, knee_i, _ = _side_indices(side_hint)
+    yx = np.stack([ly, lx], axis=-1)
 
-# 3) stance/swing 마스크 ---------------------------------------------------
-def stance_swing_masks(num_frames: int, hs_indices: List[int], to_indices: List[int]) -> Tuple[List[bool], List[bool]]:
-    """
-    HS→TO 구간을 stance, TO→다음 HS 구간을 swing으로 마킹(한쪽 발 기준).
-    - num_frames: 전체 프레임 길이
-    """
-    stance = [False]*num_frames
-    swing  = [False]*num_frames
-    hs_sorted = sorted(hs_indices)
-    to_sorted = sorted(to_indices)
+    ank_y = ly[:, ankle_i].copy()
+    sig = smooth1d(ank_y, params.ma_win)
+    vel = diff(sig, dt)
 
-    # HS와 그 직후 나타나는 TO를 쌍으로 맵핑
-    j = 0
-    pairs = []
-    for h in hs_sorted:
-        while j < len(to_sorted) and to_sorted[j] < h:
-            j += 1
-        if j < len(to_sorted):
-            t = to_sorted[j]
-            if h < t:
-                pairs.append((h, t))
-            j += 1
+    # HS: 속도 +→- 전환 근방 로컬 미니마
+    sign = np.sign(vel)
+    zc = np.where((sign[:-1] > 0) & (sign[1:] < 0))[0] + 1
+    hs_idx = []
+    last_hs_t = -1e9
+    for i in zc:
+        s = max(0, i - 2); e = min(len(sig), i + 3)
+        if sig[i] <= sig[s:e].min() and (t_ms[i] - last_hs_t) >= params.min_step_interval_ms:
+            hs_idx.append(i); last_hs_t = t_ms[i]
 
-    for (h, t) in pairs:
-        # stance: HS~TO
-        for k in range(h, min(t, num_frames)):
-            stance[k] = True
-        # swing: TO~다음 HS
-        next_h = next((x for x in hs_sorted if x > t), num_frames)
-        for k in range(t, min(next_h, num_frames)):
-            swing[k] = True
+    # TO: HS 이후 −→+ 전환점
+    to_idx = []
+    k = 0
+    for i in range(1, len(sign)):
+        if sign[i - 1] < 0 and sign[i] > 0:
+            while k + 1 < len(hs_idx) and hs_idx[k + 1] < i:
+                k += 1
+            if k < len(hs_idx) and hs_idx[k] < i:
+                to_idx.append(i)
 
-    return stance, swing
+    # MS: HS~TO 사이 무릎각 최대
+    knee_deg = _knee_angle_deg(yx, hip_i, knee_i, ankle_i)
+    ms_idx = []
+    for h in hs_idx:
+        t_candidates = [t for t in to_idx if t > h]
+        if not t_candidates:
+            continue
+        t = t_candidates[0]
+        if t - h >= 2:
+            ms_idx.append(int(np.argmax(knee_deg[h:t + 1]) + h))
 
-# 4) 운동 이벤트(Rep) ------------------------------------------------------
-def count_reps_from_angle(angle_deg: List[float], fps: float,
-                          min_rep_sec: float=0.6, prominence: float=5.0,
-                          smooth_k: int=3) -> Tuple[int, List[int], List[int]]:
-    """
-    관절각 시계열에서 반복운동(rep) 횟수 추정.
-    - 간단 규칙: valley(최대 굴곡) -> peak(최대 신전) -> 다음 valley 구간을 1 rep으로 간주
-    - prominence: peak/valley가 주변평균과 구분되는 최소 차이(도)
-    - min_rep_sec: 한 rep 최소 시간(프레임 간격 필터)
-    반환: (rep_count, rep_start_indices, rep_end_indices)  # start=end=valley 기준
-    """
-    a_raw = _series(angle_deg)
-    a = moving_average(a_raw, k=smooth_k)
-    n = len(a)
-    if n == 0:
-        return 0, [], []
+    # 보행 지표
+    steps = len(hs_idx)
+    cadence = (steps / (t_ms[-1] - t_ms[0])) * 60000.0 if steps > 1 else 0.0
+    stance_ratios, swing_ratios = [], []
+    for i, h in enumerate(hs_idx[:-1]):
+        nxt = hs_idx[i + 1]
+        tos = [t for t in to_idx if h < t < nxt]
+        if not tos:
+            continue
+        t = tos[0]
+        stance = (t_ms[t] - t_ms[h]); swing = (t_ms[nxt] - t_ms[t]); cyc = stance + swing
+        if cyc > 0:
+            stance_ratios.append(stance / cyc); swing_ratios.append(swing / cyc)
 
-    # 간이 prominence: 이동평균 대비 차이가 threshold 넘는 국소 extremum만 채택
-    base = moving_average(a, k=max(3, smooth_k))
-    delta = a - base
-    peaks = [i for i in local_maxima_idx(a, win=2) if delta[i] >= prominence]
-    valleys = [i for i in local_minima_idx(a, win=2) if -delta[i] >= prominence]
+    # 무릎/발목 지표
+    ka = KneeAnkleThresh()
+    segs = _cycle_segments(hs_idx, to_idx)
+    hyperext_flags, stiff_flags, toe_cl_list = [], [], []
+    for h, t, nxt in segs:
+        hyperext_flags.append(1 if np.any(knee_deg[h:t + 1] > ka.hyperext_deg) else 0)
+        swing_max = float(np.max(knee_deg[t:nxt + 1]))
+        stiff_flags.append(1 if swing_max < ka.stiff_knee_deg else 0)
+        toe_cl_list.append(_toe_clearance(ly, toe_i, t, nxt))
 
-    min_frames = int(min_rep_sec * fps)
-    starts, ends = [], []
+    metrics_knee_ankle = {
+        "cycles_eval": len(segs),
+        "hyperextension_ratio": round(float(np.mean(hyperext_flags)) if segs else 0.0, 3),
+        "stiff_knee_ratio":      round(float(np.mean(stiff_flags)) if segs else 0.0, 3),
+        "toe_clear_min_mean":    round(float(np.mean(toe_cl_list)) if segs else 0.0, 4),
+        "has_hyperextension":    bool(segs and any(hyperext_flags)),
+        "has_stiff_knee":        bool(segs and any(stiff_flags)),
+        "low_toe_clearance":     bool(segs and (np.mean(toe_cl_list) < ka.toe_clear_min if segs else False)),
+        "thresholds": {
+            "hyperext_deg": ka.hyperext_deg,
+            "stiff_knee_deg": ka.stiff_knee_deg,
+            "toe_clear_min": ka.toe_clear_min,
+        },
+    }
 
-    vi = 0
-    while vi < len(valleys):
-        v = valleys[vi]
-        # v 이후의 첫 peak
-        p = next((idx for idx in peaks if idx > v), None)
-        if p is None:
-            break
-        # 그 peak 이후의 다음 valley
-        nv = next((idx for idx in valleys if idx > p), None)
-        if nv is None:
-            break
-        if (nv - v) >= min_frames:
-            starts.append(v)
-            ends.append(nv)
-        vi = valleys.index(nv)  # 다음 valley부터 계속
+    result = {
+        "task": "gait",
+        "npz": str(npz_path),
+        "meta": meta,
+        "events": {
+            "HS_ms": [int(t_ms[i]) for i in hs_idx],
+            "TO_ms": [int(t_ms[i]) for i in to_idx],
+            "MS_ms": [int(t_ms[i]) for i in ms_idx],
+        },
+        "metrics": {
+            "steps": steps,
+            "cadence_spm": round(float(cadence), 2),
+            "stance_ratio_mean": round(float(np.mean(stance_ratios)) if stance_ratios else 0.0, 3),
+            "swing_ratio_mean": round(float(np.mean(swing_ratios)) if swing_ratios else 0.0, 3),
+        },
+        "metrics_knee_ankle": metrics_knee_ankle,
+    }
+    return result
 
-    return len(starts), starts, ends
 
-# 5) (옵션) 셀프테스트 ------------------------------------------------------
-if __name__ == "__main__":
-    # 가짜 파형으로 HS/TO/rep/FS 동작을 대략 확인
-    fps = 30.0
-    t = np.linspace(0, 6, int(6*fps))
+# -------------------------------
+# 3) STS 이벤트
+# -------------------------------
+def detect_sts_events(npz_path: str, params: STSParams | None = None) -> dict:
+    params = params or STSParams()
+    lx, ly, lv, t_ms, valid, meta = load_npz(npz_path)
+    dt = np.median(np.diff(t_ms)) / 1000.0 if len(t_ms) > 1 else 1 / max(meta.get("fps", 30), 1)
 
-    # 발목/힐/발끝 y 파형(사인 + 잡음) — 단지 동작 확인용
-    heel_y = 0.5 + 0.1*np.sin(2*np.pi*1.2*t) + 0.01*np.random.randn(t.size)
-    ankle_y = 0.5 + 0.1*np.sin(2*np.pi*1.2*t + np.pi/6) + 0.01*np.random.randn(t.size)
-    toe_y  = 0.5 + 0.1*np.sin(2*np.pi*1.2*t + np.pi/2) + 0.01*np.random.randn(t.size)
+    pelvis_y = smooth1d((ly[:, L_HIP] + ly[:, R_HIP]) / 2.0, params.ma_win)
+    yx = np.stack([ly, lx], axis=-1)
+    knee_deg_l = _knee_angle_deg(yx, L_HIP, L_KNEE, L_ANKLE)
+    knee_deg_r = _knee_angle_deg(yx, R_HIP, R_KNEE, R_ANKLE)
+    knee_deg = smooth1d((knee_deg_l + knee_deg_r) / 2.0, params.ma_win)
 
-    hs = detect_heel_strike(heel_y.tolist(), fps)
-    to = detect_toe_off(toe_y.tolist(), fps)
-    stance, swing = stance_swing_masks(len(t), hs, to)
+    v = diff(pelvis_y, dt)
 
-    # 각도 파형(굴곡↔신전) — rep/FS 테스트용
-    knee = 160 - 25*np.sin(2*np.pi*0.6*t) + 1.5*np.random.randn(t.size)
-    fs_events = detect_steps_hybrid(knee.tolist(), ankle_y.tolist(), fps, min_gap_ms=300, w_smooth=7)
+    so_idx = []
+    for i in range(1, len(v) - 1):
+        if v[i] < v[i - 1] and v[i] < v[i + 1] and v[i] < -0.02:
+            if not so_idx or (t_ms[i] - t_ms[so_idx[-1]]) > params.min_cycle_ms:
+                so_idx.append(i)
 
-    rc, rs, re = count_reps_from_angle(knee.tolist(), fps, min_rep_sec=0.8, prominence=6)
+    fs_idx = []
+    kv = diff(knee_deg, dt)
+    for s in so_idx:
+        for j in range(s + 1, len(v)):
+            if abs(v[j]) < 0.005 and (j - s) > int(0.5 / dt) and abs(kv[j]) < 5.0:
+                fs_idx.append(j); break
 
-    print(f"[HS] {hs[:5]} ... (총 {len(hs)})")
-    print(f"[TO] {to[:5]} ... (총 {len(to)})")
-    print(f"[stance %] {round(100*sum(stance)/len(stance),1)} / [swing %] {round(100*sum(swing)/len(swing),1)}")
-    print(f"[FS] {len(fs_events)} events, first 3 = {fs_events[:3]}")
-    print(f"[rep] count={rc}, starts={rs[:3]}, ends={re[:3]}")
+    cycles = min(len(so_idx), len(fs_idx))
+    durations = [(t_ms[fs_idx[i]] - t_ms[so_idx[i]]) / 1000.0 for i in range(cycles)]
+
+    result = {
+        "task": "sts",
+        "npz": str(npz_path),
+        "meta": meta,
+        "events": {
+            "seat_off_ms": [int(t_ms[i]) for i in so_idx],
+            "full_stand_ms": [int(t_ms[i]) for i in fs_idx],
+        },
+        "metrics": {
+            "cycles": cycles,
+            "mean_cycle_sec": round(float(np.mean(durations)) if durations else 0.0, 3),
+        },
+    }
+    return result
+
+
+# -------------------------------
+# 4) 저장 API
+# -------------------------------
+def save_events_json(result: dict, out_path: str | Path):
+    _export_json(result, out_path)
+
+def save_events_csv_timeline(result: dict, out_csv: str | Path):
+    rows = []
+    ev = result.get("events", {})
+    for k, arr in ev.items():
+        for t in arr:
+            rows.append({"event": k, "time_ms": int(t)})
+    _export_csv(rows, out_csv)
