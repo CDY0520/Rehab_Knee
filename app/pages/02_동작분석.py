@@ -1,282 +1,187 @@
 """
 파일명: app/pages/02_동작분석.py
- 업로드된 keypoints(.npz)를 불러와 보행(HS/MS/TO)·STS(Seat-off/Full-stand) 이벤트를 검출하고,
- 기본 지표(steps/cadence, cycles 등)를 표·그래프로 보여준다.
- JSON/CSV로 결과를 저장하고 다운로드를 지원한다.
+설명:
+  - 첫 화면: 분석 과제 선택(보행/STS) + 리포트 생성 버튼만 표시.
+  - 리포트 생성 후: 결과 본문 출력 → 하단에 치료사 코멘트 입력/저장 → 코멘트가 본문에 추가 표기.
+  - 저장: 리포트 생성 이후에만 다운로드 버튼 노출, 기본 형식은 텍스트(.txt) 단일.
+  - 최신 npz 파일을 자동 선택하여 분석(events.py 사용).
 
-블록 구성
- 0) 임포트/경로: Streamlit, numpy, matplotlib, 프로젝트 루트 경로 추가
- 1) 유틸:
-    - 최근 .npz 파일 탐색, 요약 메타 표시
-    - 시각화 헬퍼(라인 + 이벤트 수직선)
-    - 저장/다운로드 헬퍼(JSON/CSV)
- 2) UI 섹션:
-    - 입력 선택: 보행/STS용 .npz, 보행 측 힌트(left/right), 파라미터(스무딩 창 등)
-    - 보행 분석: detect_gait_events 호출 → 표·그래프 → 저장/다운로드
-    - STS  분석: detect_sts_events  호출 → 표·그래프 → 저장/다운로드
- 3) 유효성 체크: 보행 HS<6 또는 STS cycles<2 경고 표시
- 4) 에러 처리: 파일 없음/불량 시 사용자 메시지
+블록 구성:
+  0) 임포트 및 경로 설정
+  1) 최신 npz 자동 선택
+  2) 보행/STS 문구 변환 함수
+  3) Streamlit UI 흐름 제어(state): 과제 선택 → 리포트 생성 → 코멘트 저장 → TXT 다운로드
 
-사용 방법
- 1) 01_영상업로드에서 품질 통과 → 포즈추출(npz) 생성 후 본 탭에서 선택 분석
- 2) 저장 위치: results/json/, 그래프는 results/figures/
+사용 예:
+  streamlit run app/pages/02_동작분석.py
 """
 
-from __future__ import annotations
-import sys
 import io
 import json
+import glob
 from pathlib import Path
-from datetime import datetime
 
-import streamlit as st
 import numpy as np
-import matplotlib.pyplot as plt
+import streamlit as st
 
-# -------------------------------
-# 0) 경로/임포트
-# -------------------------------
-ROOT = Path(__file__).resolve().parents[2]  # 프로젝트 루트
-if str(ROOT) not in sys.path:
-    sys.path.append(str(ROOT))
+# ── src/events 임포트 경로 설정 ─────────────────────────────────────────────
+import sys
+ROOT = Path(__file__).resolve().parents[2]   # .../Rehab_Knee
+SRC  = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+import events  # src/events.py
 
-from src.events import (  # noqa: E402
-    detect_gait_events,
-    detect_sts_events,
-    save_events_json,
-    save_events_csv_timeline,
-    L_ANKLE, R_ANKLE, L_HIP, R_HIP,
-)
+# ── 최신 npz 자동 선택 ────────────────────────────────────────────────────
+def latest_npz(dir_glob: str = "results/keypoints/*.npz") -> str | None:
+    files = sorted(glob.glob(dir_glob), key=lambda p: Path(p).stat().st_mtime, reverse=True)
+    return files[0] if files else None
 
-KEY_DIR = ROOT / "results" / "keypoints"
-JSON_DIR = ROOT / "results" / "json"
-FIG_DIR = ROOT / "results" / "figures"
-for d in (KEY_DIR, JSON_DIR, FIG_DIR):
-    d.mkdir(parents=True, exist_ok=True)
+# ── 보행 문구 변환(쉬운 표현 + 아이콘) ─────────────────────────────────────
+def 문구_보행_측면(side_label: str, ev: dict, 무릎: dict, 선택: dict) -> list[str]:
+    msgs = []
+    hs_n = len(ev.get("HS_ms", []))
+    to_n = len(ev.get("TO_ms", []))
+    ms_n = len(ev.get("MS_ms", []))
 
-st.set_page_config(page_title="동작분석", layout="wide")
+    msgs.append(f"• {side_label} 발뒤꿈치 닿기: {'❌ 발생하지 않았습니다.' if hs_n == 0 else f' {hs_n}회 발생했습니다.'}")
+    msgs.append(f"• {side_label} 발끝 차고 나가기: {'❌ 발생하지 않았습니다.' if to_n == 0 else f' {to_n}회 발생했습니다.'}")
+    msgs.append(f"• {side_label} 중간 디딤(지지): {'❌ 확인되지 않았습니다.' if ms_n == 0 else f' {ms_n}회 확인되었습니다.'}")
 
-
-# -------------------------------
-# 1) 유틸
-# -------------------------------
-def list_npz(pattern: str | None = None) -> list[Path]:
-    files = sorted(KEY_DIR.glob("*.npz"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if pattern:
-        files = [p for p in files if pattern in p.name]
-    return files
-
-
-def load_npz_meta(npz_path: Path) -> dict:
-    d = np.load(npz_path, allow_pickle=True)
-    meta = json.loads(str(d["meta"]))
-    n = int(d["frames"].shape[0]) if "frames" in d else int(d["lm_x"].shape[0])
-    fps = float(meta.get("fps", 0))
-    dur = (n / fps) if fps > 0 else 0
-    return {"frames": n, "fps": fps, "duration_sec": dur, "width": meta.get("width"), "height": meta.get("height")}
-
-
-def plot_signal_with_events(
-    t_ms: np.ndarray,
-    y: np.ndarray,
-    title: str,
-    event_dict: dict[str, list[int]] | None = None,
-) -> bytes:
-    """matplotlib로 선+수직 이벤트 마커 렌더 → PNG bytes 반환"""
-    fig, ax = plt.subplots(figsize=(8, 3))
-    t = (t_ms - t_ms[0]) / 1000.0
-    ax.plot(t, y, linewidth=1.2)
-    if event_dict:
-        colors = {"HS_ms": "tab:red", "TO_ms": "tab:orange", "MS_ms": "tab:green",
-                  "seat_off_ms": "tab:purple", "full_stand_ms": "tab:blue"}
-        for k, arr in event_dict.items():
-            for tm in arr:
-                ax.axvline((tm - t_ms[0]) / 1000.0, color=colors.get(k, "gray"), alpha=0.6, linestyle="--", linewidth=1)
-    ax.set_xlabel("time (s)")
-    ax.set_title(title)
-    ax.grid(True, alpha=.3)
-    buf = io.BytesIO()
-    fig.tight_layout()
-    fig.savefig(buf, format="png", dpi=150)
-    plt.close(fig)
-    return buf.getvalue()
-
-
-def npz_to_basic_signal(npz_path: Path, mode: str, side_hint: str = "left") -> tuple[np.ndarray, np.ndarray]:
-    """가벼운 시각화를 위해: 보행=발목 y, STS=골반 y"""
-    d = np.load(npz_path, allow_pickle=True)
-    ly = d["lm_y"]
-    t_ms = d["t_ms"]
-    if mode == "gait":
-        idx = L_ANKLE if side_hint.startswith("l") else R_ANKLE
-        sig = ly[:, idx]
+    최대각 = 무릎.get("knee_max_deg", 0.0)
+    과신전비율 = 무릎.get("hyperext_ratio_all", 0.0)
+    if 과신전비율 > 0:
+        msgs.append(f"• ⚠️ {side_label} 무릎: 뒤로 과하게 펴지는 현상(과신전)이 관찰됩니다. (최대 {최대각:.1f}도)")
     else:
-        sig = (ly[:, L_HIP] + ly[:, R_HIP]) / 2.0
-    return t_ms, sig
+        msgs.append(f"•  {side_label} 무릎: 과신전은 관찰되지 않았습니다. (최대 {최대각:.1f}도)")
 
+    if 선택.get("stiff_knee_flag", False):
+        msgs.append(f"• ⚠️ {side_label} 무릎: 다리를 앞으로 내딛을 때 무릎 굽힘이 부족하여 동작이 뻣뻣합니다.")
+    else:
+        msgs.append(f"•  {side_label} 무릎: 다리를 앞으로 내딛을 때 굽힘이 적절합니다.")
 
-def stamp() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
+    tc_list = 선택.get("toe_clear_min_list")
+    if tc_list:
+        tc_mean = float(np.mean(tc_list))
+        if tc_mean < 0.012:
+            msgs.append(f"• 🔴 {side_label} 발: 다리를 앞으로 옮길 때 발이 충분히 들리지 않아 걸림 위험이 있습니다.")
+        else:
+            msgs.append(f"•  {side_label} 발: 다리를 앞으로 옮길 때 발 들림이 적절합니다.")
+    return msgs
 
+# ── STS 문구 변환(쉬운 표현 + 아이콘) ─────────────────────────────────────
+def 문구_STS(ev: dict, m: dict) -> list[str]:
+    msgs = []
+    so_n = len(ev.get("seat_off_ms", []))
+    fs_n = len(ev.get("full_stand_ms", []))
+    cycles = m.get("cycles", 0)
+    mean_sec = m.get("mean_cycle_sec", 0.0)
 
-# -------------------------------
-# 2) UI
-# -------------------------------
-st.title("동작분석")
-st.caption("npz 포즈 시계열을 사용해 HS/MS/TO, Seat-off/Full-stand, 를 검출합니다.")
+    if cycles == 0:
+        msgs.append("• ❌ 앉았다 일어서는 동작이 탐지되지 않았습니다.")
+        return msgs
 
-col_l, col_r = st.columns([1, 1])
+    msgs.append(f"•  앉았다 일어서기 동작: 총 {cycles}회")
+    msgs.append(f"• 평균 소요 시간: {mean_sec:.2f}초")
+    if so_n == 0:
+        msgs.append("• ⚠️ 엉덩이를 떼는 순간이 명확히 나타나지 않았습니다.")
+    if fs_n == 0:
+        msgs.append("• ⚠️ 완전히 일어선 상태가 명확히 나타나지 않았습니다.")
+    return msgs
 
-# ---- 입력 섹션: 보행
-with col_l:
-    st.subheader("보행 분석")
-    gait_files = list_npz("gait") or list_npz()  # 패턴 없으면 전체
-    sel_gait = st.selectbox(
-        "보행 .npz 파일 선택",
-        options=gait_files,
-        format_func=lambda p: p.name if isinstance(p, Path) else str(p),
-        index=0 if gait_files else None,
+# ── UI 흐름 ────────────────────────────────────────────────────────────────
+st.markdown("<h2 style='text-align:center;'>이벤트 기반 보행/STS 동작 분석 리포트</h2>", unsafe_allow_html=True)
+
+# state 초기화
+for k, v in {
+    "report_task": "보행",
+    "report_text": "",
+    "npz_path": latest_npz(),
+    "comment_text": "",
+    "comment_applied": False,
+    "report_ready": False,
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ① 첫 화면: 과제 선택 + 리포트 생성
+st.session_state.report_task = st.radio("분석 과제 선택", ["보행", "STS"], horizontal=True, index=0)
+
+gen = st.button("리포트 생성")
+if gen:
+    if not st.session_state.npz_path:
+        st.error("저장된 npz가 없습니다. 먼저 pose_probe.py로 결과를 생성하세요. (기본: results/keypoints/)")
+        st.stop()
+
+    npz_path = st.session_state.npz_path
+    out_base = Path(npz_path).stem
+    st.info(f"분석 대상 파일(자동 선택): **{Path(npz_path).name}**")
+
+    # 분석 및 본문 생성
+    if st.session_state.report_task == "보행":
+        res = events.detect_events_bilateral(npz_path)
+        lines = []
+        for side_key, side_label in [("LEFT", "왼쪽"), ("RIGHT", "오른쪽")]:
+            ev = res[side_key]["events"]
+            무릎 = res[side_key]["metrics_knee_only"]
+            선택 = res[side_key]["metrics_optional"]
+            lines.append(f"■ {side_label} 다리")
+            lines.extend(문구_보행_측면(side_label, ev, 무릎, 선택))
+            lines.append("")
+        st.session_state.report_text = "\n".join(lines)
+        st.session_state.report_payload = {"task": "gait", "npz": npz_path, "result": res}
+        st.session_state.out_name = f"{out_base}_report_gait.txt"
+    else:
+        res = events.detect_sts_events(npz_path)
+        ev, m = res["events"], res["metrics"]
+        lines = ["■ STS 분석"]
+        lines.extend(문구_STS(ev, m))
+        lines.append("")
+        st.session_state.report_text = "\n".join(lines)
+        st.session_state.report_payload = {"task": "sts", "npz": npz_path, "result": res}
+        st.session_state.out_name = f"{out_base}_report_sts.txt"
+
+    st.session_state.comment_text = ""
+    st.session_state.comment_applied = False
+    st.session_state.report_ready = True
+
+# ② 리포트 표시
+if st.session_state.report_ready and st.session_state.report_text:
+    st.subheader("리포트")
+    st.text(st.session_state.report_text)
+
+    # ③ 코멘트 입력/저장(리포트 아래 표시)
+    st.markdown("---")
+    st.markdown("#### 치료사 코멘트")
+    st.session_state.comment_text = st.text_area(
+        "",
+        value=st.session_state.comment_text,
+        placeholder="환자분의 동작 특징, 주의사항, 연습 방법, 다음 단계 권고 등을 입력하세요.",
+        height=120,
     )
-    side_hint = st.radio("측 힌트(side)", options=["left", "right"], horizontal=True, index=0)
-    run_gait = st.button("보행 이벤트 검출", use_container_width=True, type="primary", disabled=not gait_files)
+    if st.button("코멘트 저장"):
+        comment = st.session_state.comment_text.strip()
+        if comment:
+            appended = st.session_state.report_text + "\n" + "■ 치료사 코멘트\n" + "\n".join(
+                f"• 🔴 {line.strip()}" for line in comment.splitlines() if line.strip()
+            )
+            st.session_state.report_text = appended
+            st.session_state.comment_applied = True
+            st.success("코멘트를 리포트에 추가했습니다.")
+        else:
+            st.warning("코멘트가 비어 있습니다.")
 
-# ---- 입력 섹션: STS
-with col_r:
-    st.subheader("STS 분석")
-    sts_files = list_npz("sts") or list_npz()
-    sel_sts = st.selectbox(
-        "STS .npz 파일 선택",
-        options=sts_files,
-        format_func=lambda p: p.name if isinstance(p, Path) else str(p),
-        index=0 if sts_files else None,
+    # 코멘트가 반영된 최신 리포트 재표시
+    if st.session_state.comment_applied:
+        st.subheader("최종 동작 분석 리포트")
+        st.text(st.session_state.report_text)
+
+    # ④ 저장 버튼(리포트 생성 후에만 노출, 기본 TXT 단일)
+    st.markdown("---")
+    txt_buf = io.BytesIO(st.session_state.report_text.encode("utf-8"))
+    st.download_button(
+        "리포트 다운로드(.txt)",
+        data=txt_buf.getvalue(),
+        file_name=st.session_state.out_name,
+        mime="text/plain",
     )
-    run_sts = st.button("STS 이벤트 검출", use_container_width=True, type="primary", disabled=not sts_files)
-
-st.divider()
-
-# -------------------------------
-# 3) 보행 분석
-# -------------------------------
-if run_gait and sel_gait:
-    try:
-        meta = load_npz_meta(sel_gait)
-        st.info(f"파일: {sel_gait.name} | FPS {meta['fps']:.2f} | 길이 {meta['duration_sec']:.2f}s | 프레임 {meta['frames']}")
-
-        result = detect_gait_events(str(sel_gait), side_hint=side_hint)
-        ev = result["events"]
-        mt = result["metrics"]
-
-        # 요약 지표
-        st.markdown("**보행 지표**")
-        st.dataframe(
-            {
-                "steps": [mt["steps"]],
-                "cadence(spm)": [mt["cadence_spm"]],
-                "stance_ratio(mean)": [mt["stance_ratio_mean"]],
-                "swing_ratio(mean)": [mt["swing_ratio_mean"]],
-            },
-            use_container_width=True,
-        )
-
-        # 타임라인 표
-        st.markdown("**이벤트 타임라인(ms)**")
-        st.dataframe(
-            {
-                "HS_ms": [ev["HS_ms"]],
-                "TO_ms": [ev["TO_ms"]],
-                "MS_ms": [ev["MS_ms"]],
-            },
-            use_container_width=True,
-        )
-
-        # 간단 시각화
-        t_ms, sig = npz_to_basic_signal(sel_gait, mode="gait", side_hint=side_hint)
-        png = plot_signal_with_events(t_ms, sig, f"Ankle-y with HS/TO/MS ({side_hint})", ev)
-        st.image(png, caption="보행 신호 시각화", use_column_width=True)
-
-        # 유효성 체크
-        if mt["steps"] < 6:
-            st.warning("검출된 HS 수가 적습니다(steps<6). 더 긴 보행 영상 권장.")
-
-        # 저장/다운로드
-        base = f"events_gait_{stamp()}"
-        out_json = JSON_DIR / f"{base}.json"
-        save_events_json(result, out_json)
-        with out_json.open("rb") as f:
-            st.download_button("보행 이벤트 JSON 다운로드", f, file_name=out_json.name, mime="application/json")
-
-        out_csv = JSON_DIR / f"{base}.csv"
-        save_events_csv_timeline(result, out_csv)
-        with out_csv.open("rb") as f:
-            st.download_button("보행 타임라인 CSV 다운로드", f, file_name=out_csv.name, mime="text/csv")
-
-    except Exception as e:
-        st.error(f"보행 분석 실패: {e}")
-
-st.divider()
-
-# -------------------------------
-# 4) STS 분석
-# -------------------------------
-if run_sts and sel_sts:
-    try:
-        meta = load_npz_meta(sel_sts)
-        st.info(f"파일: {sel_sts.name} | FPS {meta['fps']:.2f} | 길이 {meta['duration_sec']:.2f}s | 프레임 {meta['frames']}")
-
-        result = detect_sts_events(str(sel_sts))
-        ev = result["events"]
-        mt = result["metrics"]
-
-        # 요약 지표
-        st.markdown("**STS 지표**")
-        st.dataframe(
-            {
-                "cycles": [mt["cycles"]],
-                "mean_cycle_sec": [mt["mean_cycle_sec"]],
-            },
-            use_container_width=True,
-        )
-
-        # 타임라인 표
-        st.markdown("**이벤트 타임라인(ms)**")
-        st.dataframe(
-            {
-                "seat_off_ms": [ev["seat_off_ms"]],
-                "full_stand_ms": [ev["full_stand_ms"]],
-            },
-            use_container_width=True,
-        )
-
-        # 간단 시각화
-        t_ms, sig = npz_to_basic_signal(sel_sts, mode="sts")
-        png = plot_signal_with_events(t_ms, sig, "Pelvis-y with Seat-off/Full-stand", ev)
-        st.image(png, caption="STS 신호 시각화", use_column_width=True)
-
-        # 유효성 체크
-        if mt["cycles"] < 2:
-            st.warning("검출된 반복 횟수가 적습니다(cycles<2). STS 3회 이상 촬영 권장.")
-
-        # 저장/다운로드
-        base = f"events_sts_{stamp()}"
-        out_json = JSON_DIR / f"{base}.json"
-        save_events_json(result, out_json)
-        with out_json.open("rb") as f:
-            st.download_button("STS 이벤트 JSON 다운로드", f, file_name=out_json.name, mime="application/json")
-
-        out_csv = JSON_DIR / f"{base}.csv"
-        save_events_csv_timeline(result, out_csv)
-        with out_csv.open("rb") as f:
-            st.download_button("STS 타임라인 CSV 다운로드", f, file_name=out_csv.name, mime="text/csv")
-
-    except Exception as e:
-        st.error(f"STS 분석 실패: {e}")
-
-# -------------------------------
-# 5) 네비게이션
-# -------------------------------
-st.divider()
-col_a, col_b = st.columns(2)
-with col_a:
-    st.link_button("업로드로 돌아가기", "01_영상업로드")
-with col_b:
-    st.link_button("다음 탭으로 이동(처방/모니터링)", "#")  # 추후 라우팅 연결
