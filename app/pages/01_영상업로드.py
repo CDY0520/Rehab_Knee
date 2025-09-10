@@ -2,8 +2,8 @@
 파일명: app/pages/01_영상업로드.py
  재활 프로젝트 스트림릿 ① 영상 업로드 페이지.
  4개 영상(보행 정면·측면, STS 정면·측면) 업로드 → 기본 메타(FPS/해상도/길이) 확인 →
- MediaPipe 기반 Q-metrics 계산(avg_visibility, visible_ratio, bbox_ratio_mean, fps,
- occlusion_rate, jitter_std) → 통과/재촬영 판정 및 JSON 저장/다운로드까지 수행한다.
+ MediaPipe 기반 Q-metrics 계산(avg_visibility, visible_ratio, fps, occlusion_rate, jitter_std)
+ → 통과/재촬영 판정 및 JSON 저장/다운로드까지 수행한다.
 
 블록 구성
  0) 임포트/경로: pathlib/time/tempfile/OpenCV/Streamlit/pandas + qmetrics 모듈
@@ -154,7 +154,6 @@ if submitted:
                 "길이(초)": meta["duration_sec"],
                 "avg_vis": qm.get("avg_visibility", 0),
                 "vis_ratio": qm.get("visible_ratio", 0),
-                "bbox_ratio": qm.get("bbox_ratio_mean", 0),
                 "occlusion": qm.get("occlusion_rate", 0),
                 "jitter_std": qm.get("jitter_std", 0),
                 "판정": "통과 ✅" if qm.get("pass") else "재촬영 ⚠️",
@@ -163,7 +162,7 @@ if submitted:
             rec.update({
                 "상태": "분석 실패",
                 "해상도": "-", "FPS": "-", "길이(초)": "-",
-                "avg_vis": "-", "vis_ratio": "-", "bbox_ratio": "-",
+                "avg_vis": "-", "vis_ratio": "-",
                 "occlusion": "-", "jitter_std": "-", "판정": "분석 실패"
             })
         rows.append(rec)
@@ -173,7 +172,7 @@ if submitted:
     st.markdown("### 영상 품질 분석 결과")
     # --- 결과 표(요청 컬럼만) ---
     ordered_cols = ["클립","상태","파일","해상도","FPS","길이(초)","avg_vis","vis_ratio",
-                    "bbox_ratio","occlusion","jitter_std","판정"]
+                    "occlusion","jitter_std","판정"]
     df = pd.DataFrame(rows)[ordered_cols]
     st.dataframe(df, use_container_width=True)
 
@@ -189,9 +188,6 @@ if submitted:
         if qm.get("fps", 0) < th.get("fps_min", 24):                    fails.append(f'FPS<{th.get("fps_min", 24)}')
         if qm.get("avg_visibility", 1) < th.get("avg_visibility", .6):  fails.append("avg_vis 낮음")
         if qm.get("visible_ratio", 1) < th.get("visible_ratio", .8):    fails.append("vis_ratio 낮음")
-        b = qm.get("bbox_ratio_mean", 0)
-        if b < th.get("bbox_min", .35):                                   fails.append("bbox_ratio 낮음")
-        if b > th.get("bbox_max", .90):                                  fails.append("bbox_ratio 높음")
         if qm.get("occlusion_rate", 0) > th.get("occlusion_max", .10):   fails.append("occlusion 높음")
         if qm.get("duration_sec", 0) < th.get("duration_min", 20):
             fails.append(f"영상 길이<{th.get('duration_min', 20)}s")
@@ -200,10 +196,6 @@ if submitted:
 
     def guidance(miss: list[str]) -> list[str]:
         tips = []
-        if any("bbox_ratio 낮음" in m for m in miss):
-            tips.append("피사체가 너무 작음 → 카메라 더 가까이/줌인(전신 35–90%).")
-        if any("bbox_ratio 높음" in m for m in miss):
-            tips.append("피사체가 너무 큼 → 한두 걸음 뒤로(전신 잘림 방지).")
         if any("avg_vis 낮음" in m for m in miss):
             tips.append("가시성 낮음 → 조명 밝게, 대비 색상, 가림 제거.")
         if any("vis_ratio 낮음" in m for m in miss):

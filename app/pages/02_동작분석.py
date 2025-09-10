@@ -105,8 +105,8 @@ for k, v in {
         st.session_state[k] = v
 
 # ① 첫 화면: 과제 선택 + 리포트 생성
-st.session_state.report_task = st.radio("분석 과제 선택", ["보행", "STS"], horizontal=True, index=0)
-
+st.markdown("### 분석 과제 선택")
+st.session_state.report_task = st.radio(["보행", "STS"], horizontal=True, index=0)
 gen = st.button("리포트 생성")
 if gen:
     if not st.session_state.npz_path:
@@ -152,7 +152,7 @@ if st.session_state.report_ready and st.session_state.report_text:
 
     # ③ 코멘트 입력/저장(리포트 아래 표시)
     st.markdown("---")
-    st.markdown("#### 치료사 코멘트")
+    st.markdown("### 치료사 코멘트")
     st.session_state.comment_text = st.text_area(
         "",
         value=st.session_state.comment_text,
