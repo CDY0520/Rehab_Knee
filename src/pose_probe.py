@@ -1,5 +1,6 @@
 """
 파일명: src/pose_probe.py
+
 설명:
   - 입력 영상에서 MediaPipe Pose 33 랜드마크(x,y,visibility)를 추출해 시계열(.npz 기본, .csv 옵션)로 저장한다.
   - (포즈 정확도 평가) 라벨 있는 비디오일 때 공식 지표 4개를 산출한다:

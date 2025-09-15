@@ -614,7 +614,7 @@ if __name__ == "__main__":
         print(f"[saved] results/reports/{stem}_timeline.csv")
         # 지표 요약
         save_events_csv_metrics(res, outdir / f"{stem}_metrics.csv")
-        print(f"[saved] results/reports/{stem}_metrics.csv}")
+        print(f"[saved] results/reports/{stem}_metrics.csv")
         # 스텝·스트라이드
         if res.get("task") == "gait":
             save_steps_csv(res, outdir / f"{stem}_steps.csv")
