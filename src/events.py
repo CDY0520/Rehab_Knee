@@ -1,16 +1,12 @@
 """
 파일명: src/events.py
-설명(업데이트):
-  - Mediapipe Pose 시계열(.npz)로 보행(Gait)·STS 이벤트/지표를 계산한다.
-  - Gait
-      · 이벤트: HS, TO, MS, GENU_RECURVATUM(중간 입각기 급신전 스냅; 과신전 이벤트)
-      · 플랫풋 차단: 힐-토 차이와 foot rocker 진폭이 작으면 HS/TO 미검출(=0건)
-      · 지표: 무릎 최대 내각, near-extension 비율/최대 지속, stiff-knee, swing peak flex, toe-clearance,
-              GENU_RECURVATUM 개수·최대점수
-  - STS
-      · 이벤트: Seat-off, Full-stand
-      · 지표: 사이클 횟수, 평균 소요시간
-  - 저장: JSON 요약 + 시간순 타임라인 CSV + 지표 CSV + 스텝 CSV + 스트라이드 CSV (results/reports)
+설명(업데이트, 전체본):
+  - Mediapipe Pose 시계열(.npz)에서 보행(Gait)·STS 이벤트/지표 계산.
+  - HS/TO/MS 전부 새 규칙으로 교체:
+      · diff_ht(t)=heel_y−toe_y 파형으로 각 사이드의 주기 내 이벤트를
+        MS(플랫 구간 중앙) → TO(diff_ht 음의 피크) → HS(diff_ht 양의 피크) 순서로 검출.
+      · diff_ht 진폭이 전 구간에서 극히 작으면(마비·플랫풋) 해당 사이드 이벤트 0건 처리.
+  - 출력: JSON 요약, 타임라인 CSV, 지표 CSV, 스텝/스트라이드 CSV (results/reports)
 """
 
 from __future__ import annotations
@@ -39,26 +35,29 @@ L_HEEL, R_HEEL = 29, 30  # 뒤꿈치
 @dataclass
 class GaitParams:
     # 품질 가드
-    ma_win: int = 3
+    ma_win: int = 5
     min_step_interval_ms: int = 200
     vis_min: float = 0.6
     bbox_min: float = 0.01
     bbox_max: float = 0.6
-    # near-extension(보조 각도 지표): 굴곡각 ≤ 이 값이면 '거의 신전'
-    near_ext_flex_deg: float = 5.0
-    # stiff-knee 기준(스윙 최대 굴곡 평균)
+
+    # diff_ht 기반 규칙
+    ms_zero_eps_rel: float = 0.003      # MS 후보: |heel−toe| ≤ eps
+    prom_rel: float = 0.006             # TO/HS 피크 prominence 최소
+    min_gap_ms: int = 200               # 이벤트 간 최소 간격
+    min_diffht_amp_rel: float = 0.004   # 전체 진폭이 이보다 작으면 이벤트 0건 처리
+
+    # 보조 지표/지표 산출
+    near_ext_flex_deg: float = 8.0
     stiff_knee_deg: float = 40.0
-    # toe-clearance 최소(상대 y차)
-    toe_clear_min: float = 0.012
-    # GENU_RECURVATUM(스냅) 탐지
-    z_omega_thresh: float = 2.0
-    z_jerk_thresh: float = 2.0
-    stance_mid_lo: float = 0.20
-    stance_mid_hi: float = 0.50
+    toe_clear_min: float = 0.010
+
+    # GENU_RECURVATUM(과신전 스냅) 탐지
+    z_omega_thresh: float = 1.3
+    z_jerk_thresh: float = 1.5
+    stance_mid_lo: float = 0.18
+    stance_mid_hi: float = 0.55
     refractory_frac: float = 0.15
-    # HS/TO 게이트(플랫풋 차단)
-    ht_delta_rel: float = 0.010        # heel−toe 최소 차이(상대값)
-    min_rocker_amp_rel: float = 0.015  # foot rocker 최소 진폭(상대값)
 
 @dataclass
 class STSParams:
@@ -90,13 +89,14 @@ def smooth1d(x: np.ndarray, win: int):
     return np.convolve(x, k, mode="same")
 
 def diff(x: np.ndarray, dt: float):
-    """중심차분 1차 미분"""
     dx = np.zeros_like(x, dtype=float)
     if len(x) > 1:
         dx[1:-1] = (x[2:] - x[:-2]) / (2 * dt)
         dx[0] = (x[1] - x[0]) / dt
         dx[-1] = (x[-1] - x[-2]) / dt
     return dx
+
+def vel(sig: np.ndarray, fps: float): return np.gradient(sig) * fps
 
 def _export_json(obj: dict, out: str | Path):
     out = Path(out); out.parent.mkdir(parents=True, exist_ok=True)
@@ -109,7 +109,6 @@ def _export_csv(rows: list[dict], out: str | Path):
     pd.DataFrame(rows).to_csv(out, index=False, encoding="utf-8-sig")
 
 def _robust_z(x: np.ndarray, eps: float = 1e-9):
-    """중앙값/MAD 기반 z-score"""
     x = np.asarray(x, dtype=float)
     med = np.nanmedian(x)
     mad = np.nanmedian(np.abs(x - med)) + eps
@@ -119,7 +118,6 @@ def _robust_z(x: np.ndarray, eps: float = 1e-9):
 # Geometry: knee angle
 # ───────────────────────────────
 def _knee_angle_deg(yx: np.ndarray, hip_i: int, knee_i: int, ankle_i: int) -> np.ndarray:
-    """무릎 '내각' [0..180]°: 180°≈완전신전, 값이 작을수록 굴곡↑"""
     a = yx[:, hip_i] - yx[:, knee_i]
     b = yx[:, ankle_i] - yx[:, knee_i]
     num = (a * b).sum(axis=1)
@@ -128,96 +126,103 @@ def _knee_angle_deg(yx: np.ndarray, hip_i: int, knee_i: int, ankle_i: int) -> np
     return np.degrees(np.arccos(cos))
 
 def _knee_flexion_deg_from_inner(inner_deg: np.ndarray) -> np.ndarray:
-    """굴곡각 = 180° - 내각. 0°=완전신전, 값↑일수록 굴곡↑"""
     return 180.0 - np.asarray(inner_deg, dtype=float)
 
 # ───────────────────────────────
-# Gait: HS/TO with flatfoot gating
+# diff_ht 기반 로컬 피크/골짜기
 # ───────────────────────────────
-def _hs_to_single_side(lm_y: np.ndarray, t_ms: np.ndarray,
-                       heel_i: int, toe_i: int, hip_i: int,
-                       ma_win: int, min_step_ms: int,
-                       amp_rel: float, ht_rel: float):
-    """
-    HS: foot_y(=max(heel_y,toe_y)) 로컬최대 ∧ (heel−toe ≥ ht_min) ∧ 간격조건
-    TO: 인접 HS~HS 사이에서 foot_y 로컬최저 ∧ (heel−toe ≤ −ht_min)
-        그리고 rocker 진폭(HS값−TO값) ≥ amp_min
-    → 힐·토 차이와 rocker 진폭이 작으면 HS/TO 모두 미검출(=빈 리스트)
-    """
-    heel = smooth1d(lm_y[:, heel_i].astype(float), ma_win)
-    toe  = smooth1d(lm_y[:, toe_i].astype(float),  ma_win)
-    foot = np.maximum(heel, toe)
-    diff_ht = heel - toe  # +면 힐이 더 낮음(힐 리드)
+def _local_extrema_with_prominence(x: np.ndarray, kind: str, prom_min: float):
+    idx = []
+    n = len(x)
+    for i in range(1, n-1):
+        if not np.isfinite(x[i-1:i+2]).all(): continue
+        if kind == "max":
+            if x[i] >= x[i-1] and x[i] >= x[i+1]:
+                left = np.max(x[:i]) if i > 0 else x[i]
+                right = np.max(x[i+1:]) if i < n-1 else x[i]
+                base = min(left, right)
+                prom = x[i] - base
+                if prom >= prom_min: idx.append(i)
+        else:
+            if x[i] <= x[i-1] and x[i] <= x[i+1]:
+                left = np.min(x[:i]) if i > 0 else x[i]
+                right = np.min(x[i+1:]) if i < n-1 else x[i]
+                base = max(left, right)
+                prom = base - x[i]
+                if prom >= prom_min: idx.append(i)
+    return idx
 
-    # 상대 임계 → 절대: hip↔heel 수직거리 중앙값을 스케일로 사용
+# ───────────────────────────────
+# 새 규칙: MS→TO→HS (diff_ht 기반)
+# ───────────────────────────────
+def _hs_to_ms_single_side(lm_y: np.ndarray, t_ms: np.ndarray,
+                          heel_i: int, toe_i: int, hip_i: int, params: GaitParams):
+    """반환: (hs_idx, to_idx, ms_idx)  — 기존 키 이름(HS/TO/MS)은 동일하게 사용"""
+    heel = smooth1d(lm_y[:, heel_i].astype(float), params.ma_win)
+    toe  = smooth1d(lm_y[:, toe_i].astype(float),  params.ma_win)
+    diff_ht = heel - toe  # +: heel이 더 낮음(힐 리드)
+
+    # 스케일 및 임계
     scale = np.nanmedian(np.abs(lm_y[:, hip_i] - lm_y[:, heel_i]))
     if not np.isfinite(scale) or scale <= 0:
-        s2 = np.nanstd(foot)
+        s2 = np.nanstd(diff_ht)
         scale = s2 if np.isfinite(s2) and s2 > 0 else 1.0
-    amp_min = amp_rel * scale
-    ht_min  = ht_rel  * scale
+    eps = params.ms_zero_eps_rel * scale
+    prom_min = params.prom_rel * scale
 
-    def is_local_max(sig, i): return (sig[i] >= sig[i-1]) and (sig[i] >= sig[i+1])
-    def is_local_min(sig, i): return (sig[i] <= sig[i-1]) and (sig[i] <= sig[i+1])
+    # [Fail-fast] 전체 진폭이 작으면 이벤트 0건 처리(마비·플랫풋)
+    finite = np.isfinite(diff_ht)
+    amp95 = np.nanpercentile(np.abs(diff_ht[finite]), 95) if np.any(finite) else 0.0
+    if amp95 < params.min_diffht_amp_rel * scale:
+        return [], [], []
 
-    # HS 후보
-    hs_idx = []
-    last_t = -1e12
-    for i in range(1, len(foot)-1):
-        if not np.isfinite(foot[i]) or not np.isfinite(diff_ht[i]): continue
-        if is_local_max(foot, i) and (diff_ht[i] >= ht_min) and ((t_ms[i]-last_t) >= min_step_ms):
-            hs_idx.append(i); last_t = t_ms[i]
+    # fps / 속도
+    if len(t_ms) > 1:
+        dt_s = float(np.median(np.diff(t_ms))) / 1000.0
+        fps = 1.0 / max(dt_s, 1e-6)
+    else:
+        fps = 30.0
+    v = vel(diff_ht, fps)
 
-    # TO 후보(HS~다음 HS 구간)
-    to_idx = []
-    for k, h in enumerate(hs_idx[:-1]):
-        nxt = hs_idx[k+1]
-        cand_j = []
-        for j in range(max(h+1,1), min(nxt, len(foot)-1)):
-            if not np.isfinite(foot[j]) or not np.isfinite(diff_ht[j]): continue
-            if is_local_min(foot, j) and (diff_ht[j] <= -ht_min):
-                cand_j.append(j)
-        if not cand_j:
-            continue
-        best_j, best_v = None, +np.inf
-        for j in cand_j:
-            amp = foot[h] - foot[j]
-            if amp >= amp_min and foot[j] < best_v:
-                best_v, best_j = foot[j], j
-        if best_j is not None:
-            to_idx.append(best_j)
+    # MS 후보: |diff_ht| 작고 속도도 작은 구간의 중앙 프레임
+    v_abs = np.abs(v[np.isfinite(v)])
+    v_thr = np.nanpercentile(v_abs, 40) if len(v_abs) else 0.0
+    ms_mask = np.isfinite(diff_ht) & (np.abs(diff_ht) <= eps) & (np.abs(v) <= v_thr)
+    ms_idx_raw = np.where(ms_mask)[0]
+    ms_idx = []
+    if len(ms_idx_raw):
+        cuts = np.where(np.diff(ms_idx_raw) > 1)[0] + 1
+        for seg in np.split(ms_idx_raw, cuts):
+            if len(seg) == 0: continue
+            ms_idx.append(int(seg[len(seg)//2]))
 
-    return hs_idx, to_idx
+    # 전 범위 TO/HS 후보(emin/ emax) 미리 계산
+    to_cands = _local_extrema_with_prominence(diff_ht, "min", prom_min)
+    hs_cands = _local_extrema_with_prominence(diff_ht, "max", prom_min)
+
+    # MS→TO→HS 순서로 묶기
+    hs_idx, to_idx, ms_out = [], [], []
+    for m in ms_idx:
+        # m 이후 TO
+        c1 = [j for j in to_cands if j > m and (t_ms[j] - t_ms[m]) >= params.min_gap_ms]
+        if not c1: continue
+        j = c1[0]
+        # TO 이후 HS
+        c2 = [k for k in hs_cands if k > j and (t_ms[k] - t_ms[j]) >= params.min_gap_ms]
+        if not c2: continue
+        k = c2[0]
+        to_idx.append(j); hs_idx.append(k); ms_out.append(m)
+
+    L = min(len(hs_idx), len(to_idx), len(ms_out))
+    return hs_idx[:L], to_idx[:L], ms_out[:L]
 
 # ───────────────────────────────
-# Gait: contralateral TO→HS → MS
-# ───────────────────────────────
-def _ms_from_contra(pelvis_y: np.ndarray, to_ctr: list[int], hs_ctr: list[int]) -> list[int]:
-    ms = []; j = 0
-    for to in to_ctr:
-        while j < len(hs_ctr) and hs_ctr[j] <= to: j += 1
-        if j >= len(hs_ctr): break
-        hs = hs_ctr[j]
-        if hs - to >= 2:
-            seg = pelvis_y[to:hs+1]
-            ms.append(int(np.nanargmin(seg) + to))
-    return ms
-
-# ───────────────────────────────
-# Gait: GENU_RECURVATUM(과신전 스냅) 탐지
+# GENU_RECURVATUM(과신전 스냅)
 # ───────────────────────────────
 def _detect_genu_recurvatum_per_side(
     knee_flex_deg: np.ndarray, hs_list: list[int], to_list: list[int],
     t_ms: np.ndarray, fps: float, params: GaitParams
 ):
-    """
-    각 스탠스 20–50% 구간에서:
-      - 무릎 굴곡각 ≤ near_ext_flex_deg(거의 신전)
-      - 각속도(ω) 로컬최대의 robust z ≥ z_omega_thresh
-      - 저크(j) robust z ≥ z_jerk_thresh
-      - 피크 직후 가속도(+→−) 부호전환
-    조건을 만족하는 프레임을 GENU_RECURVATUM 이벤트로 1개 선택.
-    """
     k = smooth1d(np.asarray(knee_flex_deg, float), win=5)
     omega = np.gradient(k) * fps
     accel = np.gradient(omega) * fps
@@ -234,12 +239,13 @@ def _detect_genu_recurvatum_per_side(
         if b <= a+2: continue
 
         zω = _robust_z(omega[a:b]); zj = _robust_z(jerk[a:b])
+        thr_ω = np.nanpercentile(omega[a:b], 85)
         idxs = np.arange(a, b)
         is_local_max = (omega[idxs] > np.roll(omega[idxs], 1)) & (omega[idxs] >= np.roll(omega[idxs], -1))
         cond = (
-            (k[idxs] <= params.near_ext_flex_deg) &
+            (k[idxs] <= params.near_ext_flex_deg + 2.0) &
             (zω >= params.z_omega_thresh) &
-            (zj >= params.z_jerk_thresh) &
+            ((zj >= params.z_jerk_thresh) | (omega[idxs] > thr_ω)) &
             is_local_max
         )
         cand = idxs[cond]
@@ -266,18 +272,16 @@ def _detect_genu_recurvatum_per_side(
     return out
 
 # ───────────────────────────────
-# Gait: per-side result and metrics
+# per-side result builder
 # ───────────────────────────────
 def _side_result(label: str, t_ms: np.ndarray,
                  hs_idx: list[int], to_idx: list[int], ms_idx: list[int],
                  knee_inner_deg: np.ndarray, lm_y: np.ndarray, toe_i: int,
                  params: GaitParams, fps: float) -> dict:
-    # 각도 체계
-    knee_flex = _knee_flexion_deg_from_inner(knee_inner_deg)  # 0=신전, +=굴곡
+    knee_flex = _knee_flexion_deg_from_inner(knee_inner_deg)
     qmask = np.isfinite(knee_flex)
     knee_max_inner = float(np.nanmax(knee_inner_deg[qmask])) if np.any(qmask) else 0.0
 
-    # near-extension(보조 각도 지표)
     near_thr = params.near_ext_flex_deg
     near_mask = qmask & (knee_flex <= near_thr)
     near_idx = np.where(near_mask)[0]
@@ -288,7 +292,6 @@ def _side_result(label: str, t_ms: np.ndarray,
         for g in np.split(near_idx, splits):
             longest = max(longest, int(t_ms[g[-1]] - t_ms[g[0]]))
 
-    # GENU_RECURVATUM 탐지
     gr = _detect_genu_recurvatum_per_side(
         knee_flex_deg=knee_flex, hs_list=hs_idx, to_list=to_idx, t_ms=t_ms, fps=fps, params=params
     )
@@ -296,7 +299,6 @@ def _side_result(label: str, t_ms: np.ndarray,
     gr_ms  = [e["time_ms"] for e in gr]
     gr_scores = [e["score"] for e in gr] if gr else []
 
-    # 스윙 최대 굴곡, 토우클리어런스
     swing_peaks, toe_clear = None, None
     if len(hs_idx) >= 1 and len(to_idx) >= 1:
         swing_peaks = []; toe_clear = []
@@ -341,7 +343,7 @@ def _side_result(label: str, t_ms: np.ndarray,
     }
 
 # ───────────────────────────────
-# Gait: bilateral API
+# Bilateral API
 # ───────────────────────────────
 def detect_events_bilateral(npz_path: str, params: GaitParams | None = None) -> dict:
     params = params or GaitParams()
@@ -365,22 +367,9 @@ def detect_events_bilateral(npz_path: str, params: GaitParams | None = None) -> 
     lx = lx.copy(); ly = ly.copy()
     lx[~mask, :] = np.nan; ly[~mask, :] = np.nan
 
-    # HS/TO with flatfoot gate
-    hs_L, to_L = _hs_to_single_side(
-        ly, t_ms, L_HEEL, L_FOOT_INDEX, L_HIP,
-        params.ma_win, params.min_step_interval_ms,
-        params.min_rocker_amp_rel, params.ht_delta_rel
-    )
-    hs_R, to_R = _hs_to_single_side(
-        ly, t_ms, R_HEEL, R_FOOT_INDEX, R_HIP,
-        params.ma_win, params.min_step_interval_ms,
-        params.min_rocker_amp_rel, params.ht_delta_rel
-    )
-
-    # MS
-    pelvis_y = smooth1d((ly[:, L_HIP] + ly[:, R_HIP]) / 2.0, max(3, params.ma_win))
-    ms_L = _ms_from_contra(pelvis_y, to_ctr=to_R, hs_ctr=hs_R) if (len(to_R) and len(hs_R)) else []
-    ms_R = _ms_from_contra(pelvis_y, to_ctr=to_L, hs_ctr=hs_L) if (len(to_L) and len(hs_L)) else []
+    # 새 규칙 HS/TO/MS
+    hs_L, to_L, ms_L = _hs_to_ms_single_side(ly, t_ms, L_HEEL, L_FOOT_INDEX, L_HIP, params)
+    hs_R, to_R, ms_R = _hs_to_ms_single_side(ly, t_ms, R_HEEL, R_FOOT_INDEX, R_HIP, params)
 
     # 각도
     yx = np.stack([ly, lx], axis=-1)
@@ -484,10 +473,17 @@ def save_events_csv_metrics(result: dict, out_csv: str | Path):
     rows = []
     if result.get("task") == "gait":
         for side in ["LEFT", "RIGHT"]:
-            m = result.get(side, {}).get("metrics", {})
-            ev = result.get(side, {}).get("events", {})
+            side_res = result.get(side, {})
+            m  = side_res.get("metrics", {})
+            ev = side_res.get("events",  {})
             rows.append({
                 "side": side,
+                # 이벤트 개수
+                "hs_count": len(ev.get("HS_ms", [])),
+                "to_count": len(ev.get("TO_ms", [])),
+                "ms_count": len(ev.get("MS_ms", [])),
+                "genu_recurvatum_count": m.get("genu_recurvatum_count"),
+                # 핵심 지표
                 "knee_max_inner_deg": m.get("knee_max_inner_deg"),
                 "near_ext_ratio_all": m.get("near_ext_ratio_all"),
                 "near_ext_longest_ms": m.get("near_ext_longest_ms"),
@@ -495,9 +491,12 @@ def save_events_csv_metrics(result: dict, out_csv: str | Path):
                 "stiff_knee_flag": m.get("stiff_knee_flag"),
                 "swing_peak_flex_mean_deg": m.get("swing_peak_flex_mean_deg"),
                 "toe_clear_mean": m.get("toe_clear_mean"),
-                "genu_recurvatum_count": m.get("genu_recurvatum_count"),
                 "genu_recurvatum_score_max": m.get("genu_recurvatum_score_max"),
-                "genu_recurvatum_ms_list": ";".join(str(x) for x in ev.get("GENU_RECURVATUM_ms", [])),
+                # 참고 타임스탬프
+                "hs_ms_list": ";".join(str(x) for x in ev.get("HS_ms", [])),
+                "to_ms_list": ";".join(str(x) for x in ev.get("TO_ms", [])),
+                "ms_ms_list": ";".join(str(x) for x in ev.get("MS_ms", [])),
+                "genu_recurvatum_ms_list": ";".join(strx for strx in ev.get("GENU_RECURVATUM_ms", [])),
             })
     else:
         m = result.get("metrics", {})
@@ -519,7 +518,6 @@ def _hs_events_chrono(result: dict):
     return evs
 
 def save_steps_csv(result: dict, out_csv: str | Path):
-    """시간순 HS로 스텝 표 생성: L→R 또는 R→L 인접 HS 쌍"""
     rows = []
     if result.get("task") != "gait":
         _export_csv(rows, out_csv); return
@@ -539,7 +537,6 @@ def save_steps_csv(result: dict, out_csv: str | Path):
     _export_csv(rows, out_csv)
 
 def save_strides_csv(result: dict, out_csv: str | Path):
-    """같은 발 HS 사이 간격으로 스트라이드 표 생성"""
     rows = []
     if result.get("task") != "gait":
         _export_csv(rows, out_csv); return
@@ -609,13 +606,10 @@ if __name__ == "__main__":
         print(f"[saved] results/reports/{stem}.json")
 
     if a.save_csv:
-        # 시간순 타임라인
         save_events_csv_timeline(res, outdir / f"{stem}_timeline.csv")
         print(f"[saved] results/reports/{stem}_timeline.csv")
-        # 지표 요약
         save_events_csv_metrics(res, outdir / f"{stem}_metrics.csv")
         print(f"[saved] results/reports/{stem}_metrics.csv")
-        # 스텝·스트라이드
         if res.get("task") == "gait":
             save_steps_csv(res, outdir / f"{stem}_steps.csv")
             print(f"[saved] results/reports/{stem}_steps.csv")
