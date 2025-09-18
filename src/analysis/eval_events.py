@@ -53,6 +53,10 @@ def group_full(rows):
     for k in g: g[k].sort(key=lambda z: z['t'])
     return g
 
+def norm_side(s):
+    s = str(s).upper().strip()
+    return 'L' if s.startswith('L') else ('R' if s.startswith('R') else None)
+
 # 2) 매칭 -----------------------------------------------------------------------
 def match(gt_ts, pr_ts, tol_ms):
     used=[False]*len(pr_ts)
@@ -60,23 +64,49 @@ def match(gt_ts, pr_ts, tol_ms):
     for g in gt_ts:
         best_j, best_d = None, 10**9
         for j,p in enumerate(pr_ts):
-            if used[j]: continue
+            if used[j]:
+                continue
             d=abs(p-g)
-            if d<best_d: best_d, best_j=d, j
+            if d<best_d:
+                best_d, best_j=d, j
         if best_j is not None and best_d<=tol_ms:
-            used[best_j]=True; pairs.append((g, pr_ts[best_j]))
+            used[best_j]=True
+            pairs.append((g, pr_ts[best_j]))
     TP=len(pairs); FP=used.count(True)-TP; FN=len(gt_ts)-TP
     errs=[abs(b-a) for a,b in pairs]
     return TP,FP,FN,errs,pairs,used
 
-def build_pair_rows(gt_full, pr_full, tol_ms):
+def build_pair_rows(gt_full, pr_full, tol_ms, start_ms=None, end_ms=None):
     """
-    입력: gt_full, pr_full는 group_full()의 결과에서 특정 키의 리스트
-    출력: 페어 테이블 행들(list of dict)
-      - status: TP / FN / FP
+    gt_full/pr_full : group_full()에서 특정 (side,event) 묶음으로 넘어오는 리스트라고 가정.
+    여기서도 방어적으로 side/event/시간범위 필터를 한 번 더 적용.
     """
+    if not gt_full and not pr_full:
+        return []
+
+    # 1) 기준 side/event 결정
+    ref = gt_full[0] if gt_full else pr_full[0]
+    side = norm_side(ref['row']['side'])
+    event = ref['row']['event']
+
+    # 2) side/event 정규화·필터
+    gt_full = [x for x in gt_full if norm_side(x['row']['side'])==side and x['row']['event']==event]
+    pr_full = [x for x in pr_full if norm_side(x['row']['side'])==side and x['row']['event']==event]
+
+    # 3) 시간 윈도우 필터(선택)
+    if start_ms is not None:
+        gt_full = [x for x in gt_full if x['t']>=start_ms]
+        pr_full = [x for x in pr_full if x['t']>=start_ms]
+    if end_ms is not None:
+        gt_full = [x for x in gt_full if x['t']<=end_ms]
+        pr_full = [x for x in pr_full if x['t']<=end_ms]
+
+    # 4) 시간 정렬 후 매칭
+    gt_full = sorted(gt_full, key=lambda x: x['t'])
+    pr_full = sorted(pr_full, key=lambda x: x['t'])
     gt = [x['t'] for x in gt_full]
     pr = [x['t'] for x in pr_full]
+
     _,_,_,_,pairs,used = match(gt, pr, tol_ms)
 
     rows=[]
@@ -84,46 +114,47 @@ def build_pair_rows(gt_full, pr_full, tol_ms):
 
     # TP
     for g_t, p_t in pairs:
-        # 동일 time_ms가 중복일 수 있으므로 가장 가까운 미사용 인덱스 찾기
-        gi = min((i for i,x in enumerate(gt_full) if not used_gt[i]), key=lambda i: abs(gt_full[i]['t']-g_t))
-        pj = min((j for j,x in enumerate(pr_full) if used[j] and pr_full[j]['t']==p_t), default=None)
+        gi = min((i for i in range(len(gt_full)) if not used_gt[i]), key=lambda i: abs(gt_full[i]['t']-g_t))
+        # pred 쪽은 p_t와 가장 가까운 미사용 인덱스 선택
+        pj = min((j for j in range(len(pr_full)) if used[j]), key=lambda j: abs(pr_full[j]['t']-p_t))
         used_gt[gi]=True
         rows.append({
-            "video_id": gt_full[gi]['row']["video_id"] if gt_full else pr_full[pj]['row']["video_id"],
-            "side":     gt_full[gi]['row']["side"]     if gt_full else pr_full[pj]['row']["side"],
-            "event":    gt_full[gi]['row']["event"]    if gt_full else pr_full[pj]['row']["event"],
+            "video_id": gt_full[gi]['row']["video_id"] if "video_id" in gt_full[gi]['row'] else "",
+            "side":     side,
+            "event":    event,
             "gt_time_ms":  g_t,
             "pred_time_ms": p_t,
             "delta_ms":    p_t - g_t,
             "status": "TP"
         })
 
-    # FN (GT만 있고 매칭 실패)
+    # FN
     for i,x in enumerate(gt_full):
         if not used_gt[i]:
             rows.append({
-                "video_id": x['row']["video_id"],
-                "side":     x['row']["side"],
-                "event":    x['row']["event"],
+                "video_id": x['row'].get("video_id",""),
+                "side":     side,
+                "event":    event,
                 "gt_time_ms":  x['t'],
                 "pred_time_ms": "",
                 "delta_ms":    "",
                 "status": "FN"
             })
 
-    # FP (Pred만 있고 매칭 실패)
+    # FP
     for j,x in enumerate(pr_full):
         if not used[j]:
             rows.append({
-                "video_id": x['row']["video_id"],
-                "side":     x['row']["side"],
-                "event":    x['row']["event"],
+                "video_id": x['row'].get("video_id",""),
+                "side":     side,
+                "event":    event,
                 "gt_time_ms":  "",
                 "pred_time_ms": x['t'],
                 "delta_ms":    "",
                 "status": "FP"
             })
     return rows
+
 
 # 3) 지표 계산 -------------------------------------------------------------------
 def prf(tp,fp,fn):

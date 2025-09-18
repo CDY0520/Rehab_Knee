@@ -42,7 +42,7 @@ PRED_CSV_TPL  = "pred_{vid}.csv"
 # video_id → npz 경로 매핑 (요청 반영)
 NPZ_MAP = {
     "normal":   KEY_DIR / "sample_walk_normal.npz",
-    "hyperext": KEY_DIR / "sample_walk.npz",
+    "hyperext": KEY_DIR / "sample_walk4.npz",
 }
 
 # ───────────────────────────────────────────────────────────────────────────────

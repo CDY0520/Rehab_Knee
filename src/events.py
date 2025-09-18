@@ -1,12 +1,26 @@
 """
 파일명: src/events.py
-설명(업데이트, 전체본):
+
+설명:
   - Mediapipe Pose 시계열(.npz)에서 보행(Gait)·STS 이벤트/지표 계산.
-  - HS/TO/MS 전부 새 규칙으로 교체:
-      · diff_ht(t)=heel_y−toe_y 파형으로 각 사이드의 주기 내 이벤트를
-        MS(플랫 구간 중앙) → TO(diff_ht 음의 피크) → HS(diff_ht 양의 피크) 순서로 검출.
-      · diff_ht 진폭이 전 구간에서 극히 작으면(마비·플랫풋) 해당 사이드 이벤트 0건 처리.
-  - 출력: JSON 요약, 타임라인 CSV, 지표 CSV, 스텝/스트라이드 CSV (results/reports)
+  - HS/TO/MS 전부 새 규칙:
+      · diff_ht(t)=heel_y−toe_y 파형으로 각 사이드의 한 주기 내
+        MS(플랫 구간 중앙) → TO(diff_ht 음의 피크) → HS(diff_ht 양의 피크) 검출.
+      · diff_ht 전체 진폭이 매우 작으면(마비·플랫풋) 해당 사이드 이벤트 0건 처리.
+  - 산출:
+      · Gait: 이벤트(HS, TO, MS, GENU_RECURVATUM) + 지표(무릎 최대 내각, near-extension 비율/최대 지속,
+        stiff-knee 플래그, swing peak flex, toe-clearance, GR 개수/최대점수)
+      · STS: 이벤트(Seat-off, Full-stand) + 지표(사이클 수, 평균 소요시간)
+      · 저장: JSON 요약, 타임라인 CSV, 지표 CSV, 스텝/스트라이드 CSV (results/reports)
+
+입력: pose npz {lm_x,lm_y,lm_v,t_ms,valid,meta,...}
+
+출력: dict 결과 + 선택 저장 파일들
+
+파라미터 핵심: ms_zero_eps_rel, prom_rel, min_gap_ms, min_diffht_amp_rel,
+               near_ext_flex_deg, stiff_knee_deg, z_omega_thresh, z_jerk_thresh
+
+주의: y축은 이미지 좌표계(아래가 +). diff_ht는 발 피치의 대용 신호. 노이즈 크면 ma_win/prom_rel 조정.
 """
 
 from __future__ import annotations
@@ -52,12 +66,18 @@ class GaitParams:
     stiff_knee_deg: float = 40.0
     toe_clear_min: float = 0.010
 
-    # GENU_RECURVATUM(과신전 스냅) 탐지
-    z_omega_thresh: float = 1.3
-    z_jerk_thresh: float = 1.5
-    stance_mid_lo: float = 0.18
-    stance_mid_hi: float = 0.55
-    refractory_frac: float = 0.15
+    # 과신전 임계
+    ms_border_deg: float = 178.0  # MS 경계 컷오프
+    ms_def_deg: float = 180.0  # MS 확정 컷오프
+    ms_plateau_min_ms: float = 80.0  # MS 근방 plateau 최소 지속
+    lr_drop_min_deg: float = 5.0  # 로딩반응 최소 굴곡량(정상 하한)
+
+    # 스티프 니 임계
+    swing_stiff_deg: float = 40.0  # 확실 기준(기존 45→40)
+    swing_border_deg: float = 45.0  # 경계 상한
+    swing_peak_delay_pct: float = 0.80  # 지연 강화(0.7→0.80)
+    min_swing_ms: int = 250  # 최소 스윙 길이
+    toe_high_pct: float = 0.70  # toe-clearance 상위 퍼센타일
 
 @dataclass
 class STSParams:
@@ -200,18 +220,50 @@ def _hs_to_ms_single_side(lm_y: np.ndarray, t_ms: np.ndarray,
     to_cands = _local_extrema_with_prominence(diff_ht, "min", prom_min)
     hs_cands = _local_extrema_with_prominence(diff_ht, "max", prom_min)
 
-    # MS→TO→HS 순서로 묶기
+    # === 안전한 MS→TO→HS 선택 ===
     hs_idx, to_idx, ms_out = [], [], []
+
+    ms_next_of = {ms_idx[i]: (ms_idx[i + 1] if i + 1 < len(ms_idx) else None)
+                  for i in range(len(ms_idx))}
+
     for m in ms_idx:
-        # m 이후 TO
-        c1 = [j for j in to_cands if j > m and (t_ms[j] - t_ms[m]) >= params.min_gap_ms]
-        if not c1: continue
-        j = c1[0]
-        # TO 이후 HS
-        c2 = [k for k in hs_cands if k > j and (t_ms[k] - t_ms[j]) >= params.min_gap_ms]
-        if not c2: continue
-        k = c2[0]
-        to_idx.append(j); hs_idx.append(k); ms_out.append(m)
+        t_start = t_ms[m] + params.min_gap_ms
+        t_end = t_ms[ms_next_of[m]] if ms_next_of[m] is not None else t_ms[-1]
+        if t_end <= t_start:
+            continue
+        s = int(np.searchsorted(t_ms, t_start, 'left'))
+        e = int(np.searchsorted(t_ms, t_end, 'right'))
+        seg = diff_ht[s:e]
+        if seg.size < 3:
+            continue
+
+        # --- TO: 음수 중 |diff_ht| 최대 ---
+        mask_to = np.isfinite(seg) & (seg < 0)
+        if not np.any(mask_to):
+            continue
+        j_rel = np.argmin(seg[mask_to])  # seg[mask_to]는 음수만
+        j = s + np.flatnonzero(mask_to)[j_rel]
+        if abs(diff_ht[j]) < prom_min:  # 크기 부족 필터
+            continue
+
+        # --- HS: TO 이후 양수 중 |diff_ht| 최대 ---
+        t2_start = t_ms[j] + params.min_gap_ms
+        if t_end <= t2_start:
+            continue
+        s2 = int(np.searchsorted(t_ms, t2_start, 'left'))
+        seg2 = diff_ht[s2:e]
+        mask_hs = np.isfinite(seg2) & (seg2 > 0)
+        if not np.any(mask_hs):
+            continue
+        k_rel = np.argmax(seg2[mask_hs])
+        k = s2 + np.flatnonzero(mask_hs)[k_rel]
+        if abs(diff_ht[k]) < prom_min:
+            continue
+
+        # 기록
+        ms_out.append(m);
+        to_idx.append(j);
+        hs_idx.append(k)
 
     L = min(len(hs_idx), len(to_idx), len(ms_out))
     return hs_idx[:L], to_idx[:L], ms_out[:L]
@@ -271,6 +323,125 @@ def _detect_genu_recurvatum_per_side(
         out.append({"idx": int(best_i), "time_ms": int(t_ms[best_i]), "score": float(best_s)})
     return out
 
+# 사이클 지표 계산 함수
+def _cycle_metrics_from_events(
+    t_ms: np.ndarray,
+    knee_inner_deg: np.ndarray,  # 내부각(180=완신전)
+    toe_y: np.ndarray,
+    hs_idx: list[int], to_idx: list[int], ms_idx: list[int],
+    params: GaitParams,
+) -> list[dict]:
+    """HS→HS 사이클별 지표 산출."""
+    kd = np.asarray(knee_inner_deg, float)
+    rows = []
+
+    def _slice(a, b):
+        a = int(max(0, a)); b = int(min(len(kd)-1, b))
+        return slice(a, max(a+1, b))
+
+    for i in range(len(hs_idx)-1):
+        h0, h1 = hs_idx[i], hs_idx[i+1]
+        # 해당 주기 내 TO, MS 선택
+        to_in = [t for t in to_idx if h0 < t < h1]
+        ms_in = [m for m in ms_idx if h0 < m < h1]
+        if not to_in or not ms_in:
+            continue
+        to0, ms0 = to_in[0], ms_in[0]
+
+        # 윈도우
+        lr_end_ms = t_ms[h0] + 150.0
+        w_lr   = _slice(h0, int(np.searchsorted(t_ms, lr_end_ms, 'right')))
+        w_ms   = _slice(int(np.searchsorted(t_ms, t_ms[ms0]-100, 'left')),
+                        int(np.searchsorted(t_ms, t_ms[ms0]+100, 'right')))
+        w_late = _slice(int(np.searchsorted(t_ms, t_ms[to0]-120, 'left')), to0)
+        w_swing= _slice(to0, h1)
+
+        # 지표
+        LR_drop = kd[w_lr][0] - np.nanmin(kd[w_lr]) if (w_lr.stop-w_lr.start)>1 else np.nan
+        MS_ext  = np.nanmax(kd[w_ms])
+        fps = 1000.0 / np.median(np.diff(t_ms)) if len(t_ms)>1 else 30.0
+        plateau_ge_border = np.nansum((kd[w_ms] >= params.ms_border_deg).astype(int)) * (1000.0/fps)
+        plateau_ge_def    = np.nansum((kd[w_ms] >= params.ms_def_deg).astype(int)) * (1000.0/fps)
+        Late_ext = np.nanmax(kd[w_late]) if (w_late.stop-w_late.start)>1 else np.nan
+
+        # 스윙 최대 굴곡(= 180 - 내부각 최소)
+        swing_min_inner = np.nanmin(kd[w_swing])
+        swing_peak_flex = 180.0 - swing_min_inner
+        # 피크 시점 지연
+        swing_argmin = np.nanargmin(kd[w_swing]) if (w_swing.stop-w_swing.start)>2 else 0
+        t_peak_pct = float(swing_argmin) / max(1, (w_swing.stop-w_swing.start)-1)
+
+        # 스티프니 판정
+        # --- 스윙 특성 ---
+        swing_len_frames = (w_swing.stop - w_swing.start)
+        swing_ms = (t_ms[w_swing.stop - 1] - t_ms[w_swing.start]) if swing_len_frames > 1 else 0.0
+
+        swing_min_inner = np.nanmin(kd[w_swing])
+        swing_peak_flex = 180.0 - swing_min_inner
+
+        swing_argmin = np.nanargmin(kd[w_swing]) if swing_len_frames > 2 else 0
+        t_peak_pct = float(swing_argmin) / max(1, swing_len_frames - 1)
+
+        # toe-clearance 중앙부(40–70%) 기준 높이
+        s_mid0 = w_swing.start + int(0.40 * swing_len_frames)
+        s_mid1 = w_swing.start + int(0.70 * swing_len_frames)
+        toe_seg = toe_y[w_swing]
+        toe_mid = toe_y[s_mid0:s_mid1] if s_mid1 > s_mid0 else toe_seg
+        toe_high_thr = np.nanpercentile(toe_seg, params.toe_high_pct * 100) if len(toe_seg) else np.nan
+        toe_mid_high = (np.nanmean(toe_mid) >= toe_high_thr) if np.isfinite(toe_high_thr) else False
+
+        # --- 스티프 니 최종 규칙 ---
+        stiff = False
+        if swing_ms >= params.min_swing_ms:
+            if swing_peak_flex < params.swing_stiff_deg:
+                stiff = True
+            elif (params.swing_stiff_deg <= swing_peak_flex < params.swing_border_deg
+                  and t_peak_pct > params.swing_peak_delay_pct
+                  and toe_mid_high):
+                stiff = True
+
+        # 과신전 점수
+        score = 0
+        score += int(MS_ext >= params.ms_border_deg)
+        score += int(plateau_ge_border >= params.ms_plateau_min_ms)
+        score += int((Late_ext if np.isfinite(Late_ext) else 0.0) >= (params.ms_border_deg - 1.0))
+        score += int((LR_drop if np.isfinite(LR_drop) else 99.0) < params.lr_drop_min_deg)
+
+        if (MS_ext >= params.ms_def_deg) or (plateau_ge_def >= params.ms_plateau_min_ms/2.0):
+            hyper = "definite"
+        elif score >= 2:
+            hyper = "borderline"
+        else:
+            hyper = "none"
+
+        # --- 대표 시점: 과신전으로 분류된 사이클에서 '최대 신전' 시간 ---
+        # 후보 창 = MS 주변(±100ms) ∪ late-stance(TO 직전 120ms)
+        cand_s = min(w_ms.start, w_late.start)
+        cand_e = max(w_ms.stop, w_late.stop)
+        win = slice(cand_s, cand_e)
+        if (win.stop - win.start) > 1 and np.any(np.isfinite(kd[win])):
+            idx_local = int(np.nanargmax(kd[win]))  # 내부각 최대 = 신전 최대
+            hyperext_ms = int(t_ms[win.start + idx_local])
+        else:
+            hyperext_ms = None
+
+        rows.append(dict(
+            hs_ms=int(t_ms[h0]), hs_next_ms=int(t_ms[h1]),
+            to_ms=int(t_ms[to0]), ms_ms=int(t_ms[ms0]),
+            LR_drop_deg=float(np.round(LR_drop,3)),
+            MS_ext_deg=float(np.round(MS_ext,3)),
+            MS_plateau_ge178_ms=float(np.round(plateau_ge_border,3)),
+            MS_plateau_ge180_ms=float(np.round(plateau_ge_def,3)),
+            LateStance_ext_deg=float(np.round(Late_ext,3)) if np.isfinite(Late_ext) else None,
+            Swing_peak_flex_deg=float(np.round(swing_peak_flex,3)),
+            Swing_t_peak_pct=float(np.round(t_peak_pct,3)),
+            HYPEREXT_LEVEL=hyper,
+            STIFF_KNEE=bool(stiff),
+            hyperext_ms=hyperext_ms
+        ))
+    return rows
+
+
 # ───────────────────────────────
 # per-side result builder
 # ───────────────────────────────
@@ -292,6 +463,7 @@ def _side_result(label: str, t_ms: np.ndarray,
         for g in np.split(near_idx, splits):
             longest = max(longest, int(t_ms[g[-1]] - t_ms[g[0]]))
 
+    # jerk 기반 GR 후보(스냅형)
     gr = _detect_genu_recurvatum_per_side(
         knee_flex_deg=knee_flex, hs_list=hs_idx, to_list=to_idx, t_ms=t_ms, fps=fps, params=params
     )
@@ -299,6 +471,7 @@ def _side_result(label: str, t_ms: np.ndarray,
     gr_ms  = [e["time_ms"] for e in gr]
     gr_scores = [e["score"] for e in gr] if gr else []
 
+    # swing peak / toe-clearance 참고지표
     swing_peaks, toe_clear = None, None
     if len(hs_idx) >= 1 and len(to_idx) >= 1:
         swing_peaks = []; toe_clear = []
@@ -317,6 +490,34 @@ def _side_result(label: str, t_ms: np.ndarray,
         if swing_peaks == []: swing_peaks = None
         if toe_clear == []: toe_clear = None
 
+    # --- 사이클 지표(과신전/스티프니) ---
+    cycles = _cycle_metrics_from_events(
+        t_ms=t_ms,
+        knee_inner_deg=knee_inner_deg,
+        toe_y=lm_y[:, toe_i],
+        hs_idx=hs_idx, to_idx=to_idx, ms_idx=ms_idx,
+        params=params
+    )
+
+    # 사이클 집계
+    hyper_cnt = sum(1 for r in cycles if r["HYPEREXT_LEVEL"] != "none")
+    hyper_def = sum(1 for r in cycles if r["HYPEREXT_LEVEL"] == "definite")
+    stiff_cnt = sum(1 for r in cycles if r["STIFF_KNEE"])
+
+    # ▼ 추가: 사이클 판정 과신전을 "대표 시점(ms)" 이벤트로 변환
+    #  - cycles row에 'hyperext_ms'가 있으면 사용, 없으면 MS 시점(ms_ms) fallback
+    gr_ms_from_cycles = []
+    for r in cycles:
+        if r.get("HYPEREXT_LEVEL") != "none":
+            t_h = r.get("hyperext_ms")
+            if t_h is None:
+                t_h = r.get("ms_ms")  # fallback
+            if t_h is not None:
+                gr_ms_from_cycles.append(int(t_h))
+
+    # jerk 기반 GR과 합치기(중복 제거)
+    gr_ms_all = sorted(set(gr_ms + gr_ms_from_cycles))
+
     metrics_core = {
         "knee_max_inner_deg": round(knee_max_inner, 2),
         "near_ext_ratio_all": round(near_ratio_all, 3),
@@ -325,8 +526,13 @@ def _side_result(label: str, t_ms: np.ndarray,
         "stiff_knee_flag": bool(swing_peaks is not None and np.mean(swing_peaks) < params.stiff_knee_deg),
         "swing_peak_flex_mean_deg": float(np.mean(swing_peaks)) if swing_peaks else None,
         "toe_clear_mean": float(np.mean(toe_clear)) if toe_clear else None,
-        "genu_recurvatum_count": int(len(gr_ms)),
+        # 참고: 아래 카운트는 합쳐진 이벤트 개수로 보고
+        "genu_recurvatum_count": int(len(gr_ms_all)),
         "genu_recurvatum_score_max": float(np.max(gr_scores)) if gr_scores else None,
+        "cycles": len(cycles),
+        "hyperextension_count": int(hyper_cnt),
+        "hyperextension_definite": int(hyper_def),
+        "stiff_knee_count": int(stiff_cnt),
     }
 
     return {
@@ -336,11 +542,13 @@ def _side_result(label: str, t_ms: np.ndarray,
             "HS_ms": [int(t_ms[i]) for i in hs_idx],
             "TO_ms": [int(t_ms[i]) for i in to_idx],
             "MS_ms": [int(t_ms[i]) for i in ms_idx],
-            "GENU_RECURVATUM_idx": gr_idx,
-            "GENU_RECURVATUM_ms": gr_ms,
+            "GENU_RECURVATUM_idx": gr_idx,          # jerk 기반 인덱스는 참고로 유지
+            "GENU_RECURVATUM_ms": gr_ms_all,        # ← 합쳐진 이벤트(ms)를 사용
         },
         "metrics": metrics_core,
+        "cycles_metrics": cycles,
     }
+
 
 # ───────────────────────────────
 # Bilateral API
@@ -569,6 +777,9 @@ def _print_summary_gait(res: dict):
         print(f"      knee_max_inner={m.get('knee_max_inner_deg',0):.1f}°, "
               f"near-ext ratio={m.get('near_ext_ratio_all',0):.3f}, "
               f"GR count={m.get('genu_recurvatum_count',0)}")
+        print(f"      hyperext={m.get('hyperextension_count', 0)} "
+              f"(def={m.get('hyperextension_definite', 0)}), "
+              f"stiff={m.get('stiff_knee_count', 0)}")
 
 def _print_summary_sts(res: dict):
     m = res.get("metrics", {})
