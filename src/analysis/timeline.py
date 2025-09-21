@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 파일명: src/analysis/timeline.py
+
 기능: 포즈 npz(lm_x, lm_y, t_ms, valid)와 GT csv(event, time_ms)를 입력받아
       heel_y, toe_y, knee angle 시계열과 GT 이벤트를 타임라인 그래프로 저장한다.
+
+코드 실행
+  python src/analysis/timeline.py --pose results/keypoints/sample_walk3.npz --gt results/gt/hyperext_R.csv --side R --outdir results/plots
 
 블록 구성
  0) 라이브러리 임포트
@@ -33,6 +37,7 @@ IDX = dict(
 
 # 2) 각도 계산 유틸(angle_abc)
 def angle_abc(a, b, c):
+    """벡터 BA와 BC 사이 각도(도)"""
     ba = a - b
     bc = c - b
     nba = np.linalg.norm(ba, axis=-1) + 1e-8
@@ -63,21 +68,21 @@ def load_gt_csv(path_csv):
         return None
     df = pd.read_csv(path_csv)
 
-    # 컬럼명 트림
+    # 컬럼명 정리
     df.columns = [c.strip() for c in df.columns]
     if "event" not in df.columns or "time_ms" not in df.columns:
         raise ValueError(f"GT csv에 event,time_ms 컬럼이 필요: {list(df.columns)}")
 
     out = df[["event", "time_ms"]].copy()
-    # 값 트림 + 대문자화
+    # 값 정리
     out["event"] = out["event"].astype(str).str.strip().str.upper()
     out["time_ms"] = pd.to_numeric(out["time_ms"], errors="coerce")
 
-    # 디버그: 유니크 라벨 출력
+    # 디버그: 유니크 라벨
     print("[debug] GT unique events:", sorted(out["event"].unique().tolist()))
 
-    # HS/TO/MS만 유지
-    out = out[out["event"].isin(["HS", "TO", "MS"])].dropna(subset=["time_ms"]).reset_index(drop=True)
+    # HS/TO/MS/과신전(HY.EXT.) 유지
+    out = out[out["event"].isin(["HS", "TO", "MS", "HY.EXT."])].dropna(subset=["time_ms"]).reset_index(drop=True)
     return out
 
 # 5) 시계열 추출 함수(extract_series)
@@ -97,6 +102,7 @@ def extract_series(lm_x, lm_y, valid, side="L", normalize=True):
     ank  = np.stack([lm_x[:, i_ank],  lm_y[:, i_ank]], axis=1)
     knee_angle = angle_abc(hip, knee, ank)
 
+    # invalid 프레임 NaN
     for arr in (heel_y, toe_y, knee_angle):
         arr[~valid] = np.nan
 
@@ -113,19 +119,20 @@ def extract_series(lm_x, lm_y, valid, side="L", normalize=True):
 
 # 6) 플롯 함수(plot_timeline)
 def plot_timeline(t_ms, heel_y, toe_y, knee_ang_n, gt_df, side, save_path):
+    """타임라인 플롯을 저장하고 경로를 반환"""
     plt.figure(figsize=(14, 4.2))
     ax = plt.gca()
 
-    ax.plot(t_ms, heel_y, label="Heel_y", lw=1.2)
-    ax.plot(t_ms, toe_y,  label="Toe_y",  lw=1.2)
-    ax.plot(t_ms, knee_ang_n, label="Knee angle (norm.)", lw=1.2)
+    ax.plot(t_ms, heel_y,      label="Heel_y",            lw=1.2)
+    ax.plot(t_ms, toe_y,       label="Toe_y",             lw=1.2)
+    ax.plot(t_ms, knee_ang_n,  label="Knee angle",lw=1.2)
 
     ax.set_title(f"Timeline overlay ({'LEFT' if side=='L' else 'RIGHT'})")
     ax.set_xlabel("time (ms)")
     ax.set_ylabel("normalized scale (0-1)")
     ax.grid(True, alpha=0.2)
 
-    # GT 마커 표시
+    # GT 마커
     if gt_df is not None and len(gt_df) > 0:
         ymin = np.nanmin([np.nanmin(heel_y), np.nanmin(toe_y), np.nanmin(knee_ang_n)])
         y0 = ymin - 0.05
@@ -138,35 +145,45 @@ def plot_timeline(t_ms, heel_y, toe_y, knee_ang_n, gt_df, side, save_path):
                 ax.scatter([t], [y0], s=36, c="tab:blue", marker="o", zorder=6)
             ax.text(t, y0 - 0.03, lab, fontsize=9, ha="center", color="tab:red", zorder=6)
 
-        # y축 하한 자동 확장
+        # y축 하한 조정
         cur_lo, cur_hi = ax.get_ylim()
         if cur_lo > y0 - 0.06:
             ax.set_ylim(y0 - 0.06, cur_hi)
 
-    ax.legend(loc="lower right", ncol=4, fontsize=9, frameon=True)
+    ax.legend(loc="upper right", ncol=4, fontsize=9, frameon=True)
     plt.tight_layout()
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.savefig(save_path, dpi=200)
+    plt.savefig(save_path, dpi=200, bbox_inches="tight")
     plt.close()
     return save_path
 
 # 7) 메인 실행(main)
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--npz", required=True)
-    ap.add_argument("--gt", default=None)
-    ap.add_argument("--side", default="L", choices=["L", "R"])
-    ap.add_argument("--outdir", default="results/plots")
+    # argparse: --pose와 --npz 둘 다 지원. 저장만 수행.
+    ap = argparse.ArgumentParser(description="Pose/GT 타임라인 플롯 자동 저장")
+    ap.add_argument("--pose", "--npz", dest="npz", required=True, help="입력 pose npz 경로")
+    ap.add_argument("--gt", default=None, help="입력 GT csv 경로")
+    ap.add_argument("--side", default="L", choices=["L", "R"], help="분석 측면")
+    ap.add_argument("--outdir", default="results/plots", help="저장 디렉토리")
     args = ap.parse_args()
 
+    # 로드
     lm_x, lm_y, t_ms, valid = load_pose_npz(args.npz)
-    heel_y, toe_y, knee_ang_n = extract_series(lm_x, lm_y, valid, side=args.side, normalize=True)
-    gt_df = load_gt_csv(args.gt)
-
-    base = os.path.splitext(os.path.basename(args.npz))[0]
-    save_path = os.path.join(args.outdir, f"{base}_{args.side}_timeline.png")
+    print(f"[info] pose npz 로드 완료: {args.npz}, shape={lm_x.shape}")
+    gt_df = load_gt_csv(args.gt) if args.gt else None
     print(f"[info] GT rows: {0 if gt_df is None else len(gt_df)}")
-    print(f"[saved] {plot_timeline(t_ms, heel_y, toe_y, knee_ang_n, gt_df, args.side, save_path)}")
+
+    # 시계열
+    heel_y, toe_y, knee_ang_n = extract_series(lm_x, lm_y, valid, side=args.side, normalize=True)
+
+    # 저장 경로
+    base = os.path.splitext(os.path.basename(args.npz))[0]
+    os.makedirs(args.outdir, exist_ok=True)
+    save_path = os.path.join(args.outdir, f"{base}_{args.side}_timeline.png")
+
+    # 플롯 저장
+    saved = plot_timeline(t_ms, heel_y, toe_y, knee_ang_n, gt_df, args.side, save_path)
+    print(f"[saved] {saved}")
 
 if __name__ == "__main__":
     main()
