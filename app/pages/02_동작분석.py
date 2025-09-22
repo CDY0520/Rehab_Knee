@@ -1,187 +1,222 @@
 """
 파일명: app/pages/02_동작분석.py
 설명:
-  - 첫 화면: 분석 과제 선택(보행/STS) + 리포트 생성 버튼만 표시.
-  - 리포트 생성 후: 결과 본문 출력 → 하단에 치료사 코멘트 입력/저장 → 코멘트가 본문에 추가 표기.
-  - 저장: 리포트 생성 이후에만 다운로드 버튼 노출, 기본 형식은 텍스트(.txt) 단일.
-  - 최신 npz 파일을 자동 선택하여 분석(events.py 사용).
+  - 좌측 사이드바에 탭 구성(파일 업로드 / 동작 분석 결과 / 최종 리포트)
+  - 업로드한 npz 분석(events.py 활용), 선택된 측면만 결과 출력
+  - 누락된 이벤트/지표는 "발생 없음"으로 표시
+  - 동작 분석 결과에 치료사 코멘트 입력 → 최종 리포트에 반영
+  - 한글 용어 + 영문 약어 병기
+  - 위험 경고는 🔴, 주의 메시지는 ⚠️(노란색 세모 느낌표)
 
 블록 구성:
   0) 임포트 및 경로 설정
-  1) 최신 npz 자동 선택
-  2) 보행/STS 문구 변환 함수
-  3) Streamlit UI 흐름 제어(state): 과제 선택 → 리포트 생성 → 코멘트 저장 → TXT 다운로드
-
-사용 예:
-  streamlit run app/pages/02_동작분석.py
+  1) Streamlit 페이지 설정 + CSS 스타일 정의
+  2) 유틸 함수 정의
+  3) 사이드바 탭 메뉴 구성
+  4) 탭1: 파일 업로드 및 리포트 생성
+  5) 탭2: 동작 분석 결과(치료사 코멘트 입력)
+  6) 탭3: 최종 리포트 표시 및 다운로드
 """
 
-import io
-import json
-import glob
+import io, sys
 from pathlib import Path
-
 import numpy as np
+import pandas as pd
 import streamlit as st
 
-# ── src/events 임포트 경로 설정 ─────────────────────────────────────────────
-import sys
-ROOT = Path(__file__).resolve().parents[2]   # .../Rehab_Knee
+# ── src/events 경로 설정 ────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parents[2]
 SRC  = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 import events  # src/events.py
 
-# ── 최신 npz 자동 선택 ────────────────────────────────────────────────────
-def latest_npz(dir_glob: str = "results/keypoints/*.npz") -> str | None:
-    files = sorted(glob.glob(dir_glob), key=lambda p: Path(p).stat().st_mtime, reverse=True)
-    return files[0] if files else None
+# ── 페이지 설정 / 스타일 ────────────────────────────────────────────────────
+st.set_page_config(page_title="이벤트 기반 보행 동작 분석 리포트", layout="wide")
+st.markdown("""
+<style>
+.main {background:#f7f8fb;}
+.header{background:linear-gradient(135deg,#0f172a,#1e293b);color:#fff;
+  padding:18px 20px;border-radius:16px;margin:10px 0 14px;font-weight:700;font-size:20px;}
+.card{background:#fff;border:1px solid #e8eaf1;border-radius:16px;padding:16px;
+  box-shadow:0 4px 14px rgba(15,23,42,.06);margin-bottom:14px;}
+.h3{font-weight:700;font-size:16px;margin:0 0 10px 0;color:#0f172a}
+.small{color:#64748b;font-size:12px}
+.final{background:linear-gradient(180deg,#ffffff,#f1f5f9);
+  border:1px solid #e2e8f0;border-radius:16px;padding:18px;}
+</style>
+""", unsafe_allow_html=True)
+st.markdown("<div class='header'>이벤트 기반 보행 동작 분석 리포트</div>", unsafe_allow_html=True)
 
-# ── 보행 문구 변환(쉬운 표현 + 아이콘) ─────────────────────────────────────
-def 문구_보행_측면(side_label: str, ev: dict, 무릎: dict, 선택: dict) -> list[str]:
+# ── 상태 초기화 ─────────────────────────────────────────────────────────────
+if "report_ready" not in st.session_state:
+    st.session_state.update({
+        "npz_name":"", "npz_path":"", "side_key":None, "side_label":"",
+        "rows":[], "report_text":"", "comment":"", "comment_applied":False,
+        "out_name":"report_gait.txt", "payload":None, "report_ready":False
+    })
+
+# ── 유틸 ────────────────────────────────────────────────────────────────────
+def infer_side_from_name(name: str) -> str | None:
+    n = name.lower()
+    if "left" in n or "_l" in n or "-l" in n:  return "LEFT"
+    if "right" in n or "_r" in n or "-r" in n: return "RIGHT"
+    return None
+
+def pick_side_payload(res: dict, side_key: str):
+    side = res.get(side_key, {}) or {}
+    ev = side.get("events", {}) or {}
+    m_k = (side.get("metrics_knee_only")
+           or side.get("metrics_knee")
+           or side.get("knee_metrics")
+           or (side.get("metrics", {}) if isinstance(side.get("metrics"), dict) else {})
+           or {})
+    m_op = (side.get("metrics_optional")
+            or side.get("optional_metrics")
+            or {})
+    return ev, m_k, m_op
+
+def lines_to_df(lines: list[str]) -> pd.DataFrame:
+    return pd.DataFrame({"항목": lines})
+
+# ── 결과 문구 생성 ──────────────────────────────────────────────────────────
+def 문구_보행_측면(side_label: str, ev: dict, m_k: dict, m_op: dict) -> list[str]:
     msgs = []
+
+    # 이벤트: HS/TO/MS
     hs_n = len(ev.get("HS_ms", []))
     to_n = len(ev.get("TO_ms", []))
     ms_n = len(ev.get("MS_ms", []))
+    msgs.append(f"{side_label} 뒤꿈치 닿음(HS): {'발생 없음' if hs_n==0 else f'{hs_n}회 발생했습니다.'}")
+    msgs.append(f"{side_label} 발끝 이탈(TO): {'발생 없음' if to_n==0 else f'{to_n}회 발생했습니다.'}")
+    msgs.append(f"{side_label} 중간 디딤(MS): {'발생 없음' if ms_n==0 else f'{ms_n}회 확인되었습니다.'}")
 
-    msgs.append(f"• {side_label} 발뒤꿈치 닿기: {'❌ 발생하지 않았습니다.' if hs_n == 0 else f' {hs_n}회 발생했습니다.'}")
-    msgs.append(f"• {side_label} 발끝 차고 나가기: {'❌ 발생하지 않았습니다.' if to_n == 0 else f' {to_n}회 발생했습니다.'}")
-    msgs.append(f"• {side_label} 중간 디딤(지지): {'❌ 확인되지 않았습니다.' if ms_n == 0 else f' {ms_n}회 확인되었습니다.'}")
-
-    최대각 = 무릎.get("knee_max_deg", 0.0)
-    과신전비율 = 무릎.get("hyperext_ratio_all", 0.0)
-    if 과신전비율 > 0:
-        msgs.append(f"• ⚠️ {side_label} 무릎: 뒤로 과하게 펴지는 현상(과신전)이 관찰됩니다. (최대 {최대각:.1f}도)")
+    # 무릎 각도/과신전
+    knee_max = float(m_k.get("knee_max_deg", np.nan)) if m_k else np.nan
+    hyper_ratio = float(m_k.get("hyperext_ratio_all", 0.0)) if m_k else 0.0
+    if np.isnan(knee_max):
+        msgs.append(f"{side_label} 무릎 각도(Knee angle): 데이터 없음")
     else:
-        msgs.append(f"•  {side_label} 무릎: 과신전은 관찰되지 않았습니다. (최대 {최대각:.1f}도)")
-
-    if 선택.get("stiff_knee_flag", False):
-        msgs.append(f"• ⚠️ {side_label} 무릎: 다리를 앞으로 내딛을 때 무릎 굽힘이 부족하여 동작이 뻣뻣합니다.")
-    else:
-        msgs.append(f"•  {side_label} 무릎: 다리를 앞으로 내딛을 때 굽힘이 적절합니다.")
-
-    tc_list = 선택.get("toe_clear_min_list")
-    if tc_list:
-        tc_mean = float(np.mean(tc_list))
-        if tc_mean < 0.012:
-            msgs.append(f"• 🔴 {side_label} 발: 다리를 앞으로 옮길 때 발이 충분히 들리지 않아 걸림 위험이 있습니다.")
+        if hyper_ratio > 0:
+            msgs.append(f"⚠️ {side_label} 무릎: 과신전이 관찰됩니다. (최대 {knee_max:.1f}°)")
         else:
-            msgs.append(f"•  {side_label} 발: 다리를 앞으로 옮길 때 발 들림이 적절합니다.")
+            msgs.append(f"{side_label} 무릎: 과신전은 관찰되지 않았습니다. (최대 {knee_max:.1f}°)")
+
+    # 스윙 굴곡 부족
+    if m_op.get("stiff_knee_flag", False):
+        msgs.append(f"⚠️ {side_label} 무릎: 다리를 앞으로 내딛을 때 무릎 굽힘이 부족합니다.")
+    else:
+        msgs.append(f"{side_label} 무릎: 다리를 앞으로 내딛을 때 굽힘이 적절합니다.")
+
     return msgs
 
-# ── STS 문구 변환(쉬운 표현 + 아이콘) ─────────────────────────────────────
-def 문구_STS(ev: dict, m: dict) -> list[str]:
-    msgs = []
-    so_n = len(ev.get("seat_off_ms", []))
-    fs_n = len(ev.get("full_stand_ms", []))
-    cycles = m.get("cycles", 0)
-    mean_sec = m.get("mean_cycle_sec", 0.0)
+# ── 사이드바 네비 ──────────────────────────────────────────────────────────
+with st.sidebar:
+    nav = st.radio("메뉴", ["파일 업로드", "동작 분석 결과", "최종 리포트"], index=0)
 
-    if cycles == 0:
-        msgs.append("• ❌ 앉았다 일어서는 동작이 탐지되지 않았습니다.")
-        return msgs
+# ── 1) 파일 업로드 탭 ───────────────────────────────────────────────────────
+if nav == "파일 업로드":
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("<div class='h3'>파일 업로드 (.npz)</div>", unsafe_allow_html=True)
 
-    msgs.append(f"•  앉았다 일어서기 동작: 총 {cycles}회")
-    msgs.append(f"• 평균 소요 시간: {mean_sec:.2f}초")
-    if so_n == 0:
-        msgs.append("• ⚠️ 엉덩이를 떼는 순간이 명확히 나타나지 않았습니다.")
-    if fs_n == 0:
-        msgs.append("• ⚠️ 완전히 일어선 상태가 명확히 나타나지 않았습니다.")
-    return msgs
+    up = st.file_uploader("pose_probe 결과 .npz 파일을 업로드하세요", type=["npz"])
+    side_choice = st.radio("측면", ["자동","왼쪽","오른쪽"], horizontal=True, index=0)
+    gen = st.button("리포트 생성", use_container_width=True)
 
-# ── UI 흐름 ────────────────────────────────────────────────────────────────
-st.markdown("<h2 style='text-align:center;'>이벤트 기반 보행/STS 동작 분석 리포트</h2>", unsafe_allow_html=True)
+    if up:
+        st.caption(f"선택: **{up.name}**")
+    else:
+        st.caption("선택된 파일이 없습니다.")
 
-# state 초기화
-for k, v in {
-    "report_task": "보행",
-    "report_text": "",
-    "npz_path": latest_npz(),
-    "comment_text": "",
-    "comment_applied": False,
-    "report_ready": False,
-}.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+    if gen:
+        if not up:
+            st.error("npz 파일을 업로드하세요.")
+            st.stop()
+        # 업로드 파일 임시 저장
+        tmp_dir = Path("results/tmp_upload"); tmp_dir.mkdir(parents=True, exist_ok=True)
+        npz_path = str(tmp_dir / up.name)
+        with open(npz_path, "wb") as f: f.write(up.getbuffer())
 
-# ① 첫 화면: 과제 선택 + 리포트 생성
-st.markdown("### 분석 과제 선택")
-st.session_state.report_task = st.radio(["보행", "STS"], horizontal=True, index=0)
-gen = st.button("리포트 생성")
-if gen:
-    if not st.session_state.npz_path:
-        st.error("저장된 npz가 없습니다. 먼저 pose_probe.py로 결과를 생성하세요. (기본: results/keypoints/)")
-        st.stop()
-
-    npz_path = st.session_state.npz_path
-    out_base = Path(npz_path).stem
-    st.info(f"분석 대상 파일(자동 선택): **{Path(npz_path).name}**")
-
-    # 분석 및 본문 생성
-    if st.session_state.report_task == "보행":
+        # 이벤트 양측 분석 후 한쪽만 선택
         res = events.detect_events_bilateral(npz_path)
-        lines = []
-        for side_key, side_label in [("LEFT", "왼쪽"), ("RIGHT", "오른쪽")]:
-            ev = res[side_key]["events"]
-            무릎 = res[side_key]["metrics_knee_only"]
-            선택 = res[side_key]["metrics_optional"]
-            lines.append(f"■ {side_label} 다리")
-            lines.extend(문구_보행_측면(side_label, ev, 무릎, 선택))
-            lines.append("")
-        st.session_state.report_text = "\n".join(lines)
-        st.session_state.report_payload = {"task": "gait", "npz": npz_path, "result": res}
-        st.session_state.out_name = f"{out_base}_report_gait.txt"
-    else:
-        res = events.detect_sts_events(npz_path)
-        ev, m = res["events"], res["metrics"]
-        lines = ["■ STS 분석"]
-        lines.extend(문구_STS(ev, m))
-        lines.append("")
-        st.session_state.report_text = "\n".join(lines)
-        st.session_state.report_payload = {"task": "sts", "npz": npz_path, "result": res}
-        st.session_state.out_name = f"{out_base}_report_sts.txt"
-
-    st.session_state.comment_text = ""
-    st.session_state.comment_applied = False
-    st.session_state.report_ready = True
-
-# ② 리포트 표시
-if st.session_state.report_ready and st.session_state.report_text:
-    st.subheader("리포트")
-    st.text(st.session_state.report_text)
-
-    # ③ 코멘트 입력/저장(리포트 아래 표시)
-    st.markdown("---")
-    st.markdown("### 치료사 코멘트")
-    st.session_state.comment_text = st.text_area(
-        "",
-        value=st.session_state.comment_text,
-        placeholder="환자분의 동작 특징, 주의사항, 연습 방법, 다음 단계 권고 등을 입력하세요.",
-        height=120,
-    )
-    if st.button("코멘트 저장"):
-        comment = st.session_state.comment_text.strip()
-        if comment:
-            appended = st.session_state.report_text + "\n" + "■ 치료사 코멘트\n" + "\n".join(
-                f"• 🔴 {line.strip()}" for line in comment.splitlines() if line.strip()
-            )
-            st.session_state.report_text = appended
-            st.session_state.comment_applied = True
-            st.success("코멘트를 리포트에 추가했습니다.")
+        if side_choice == "왼쪽":
+            SIDE_KEY, SIDE_LABEL = "LEFT", "왼쪽"
+        elif side_choice == "오른쪽":
+            SIDE_KEY, SIDE_LABEL = "RIGHT", "오른쪽"
         else:
-            st.warning("코멘트가 비어 있습니다.")
+            inf = infer_side_from_name(up.name)
+            SIDE_KEY = inf if inf else "LEFT"
+            SIDE_LABEL = "왼쪽" if SIDE_KEY=="LEFT" else "오른쪽"
 
-    # 코멘트가 반영된 최신 리포트 재표시
-    if st.session_state.comment_applied:
-        st.subheader("최종 동작 분석 리포트")
+        ev, m_k, m_op = pick_side_payload(res, SIDE_KEY)
+        one_side_lines = 문구_보행_측면(SIDE_LABEL, ev, m_k, m_op)
+
+        # 상태 저장
+        st.session_state.npz_name   = up.name
+        st.session_state.npz_path   = npz_path
+        st.session_state.side_key   = SIDE_KEY
+        st.session_state.side_label = SIDE_LABEL
+        st.session_state.rows       = one_side_lines
+        st.session_state.report_text = f"■ {SIDE_LABEL} 다리\n" + "\n".join(one_side_lines)
+        st.session_state.out_name   = f"{Path(up.name).stem}_report_gait_{SIDE_KEY.lower()}.txt"
+        st.session_state.payload    = {"task":"gait","side":SIDE_KEY,"npz":npz_path}
+        st.session_state.report_ready = True
+        st.session_state.comment = ""
+        st.session_state.comment_applied = False
+
+        st.success("리포트 준비 완료. 좌측 ‘동작 분석 결과’ 탭에서 확인하세요.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ── 2) 동작 분석 결과 탭 ───────────────────────────────────────────────────
+elif nav == "동작 분석 결과":
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("<div class='h3'>동작 분석 결과</div>", unsafe_allow_html=True)
+
+    if not st.session_state.report_ready:
+        st.info("먼저 ‘파일 업로드’ 탭에서 분석을 생성하세요.")
+    else:
+        st.markdown(f"**측면: {st.session_state.side_label}**  |  **파일:** {st.session_state.npz_name}")
+        st.table(lines_to_df(st.session_state.rows))
+
+        # 치료사 코멘트
+        st.markdown("<hr>", unsafe_allow_html=True)
+        st.markdown("<div class='h3'>치료사 코멘트</div>", unsafe_allow_html=True)
+        st.session_state.comment = st.text_area(
+            "", value=st.session_state.comment, height=120,
+            placeholder="환자의 특징, 주의사항, 연습 방법, 다음 단계 권고 등을 입력"
+        )
+        if st.button("코멘트 저장", use_container_width=True):
+            c = st.session_state.comment.strip()
+            if c:
+                st.session_state.report_text = (
+                    f"■ {st.session_state.side_label} 다리\n" + "\n".join(st.session_state.rows)
+                    + "\n\n■ 치료사 코멘트\n"
+                    + "\n".join(f"⚠️ {line.strip()}" for line in c.splitlines() if line.strip())
+                )
+                st.session_state.comment_applied = True
+                st.success("코멘트를 리포트에 추가했습니다. ‘최종 리포트’ 탭에서 확인하세요.")
+            else:
+                st.warning("코멘트가 비어 있습니다.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ── 3) 최종 리포트 탭 ──────────────────────────────────────────────────────
+elif nav == "최종 리포트":
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("<div class='h3'>최종 동작 분석 리포트</div>", unsafe_allow_html=True)
+
+    if not st.session_state.report_ready or not st.session_state.report_text:
+        st.info("먼저 ‘파일 업로드’에서 리포트를 생성하고 ‘동작 분석 결과’에서 코멘트를 저장하세요.")
+    else:
+        st.markdown("<div class='final'>", unsafe_allow_html=True)
+        st.markdown(f"<div class='small'>측면: <b>{st.session_state.side_label}</b> · 파일: {st.session_state.npz_name}</div>", unsafe_allow_html=True)
         st.text(st.session_state.report_text)
 
-    # ④ 저장 버튼(리포트 생성 후에만 노출, 기본 TXT 단일)
-    st.markdown("---")
-    txt_buf = io.BytesIO(st.session_state.report_text.encode("utf-8"))
-    st.download_button(
-        "리포트 다운로드(.txt)",
-        data=txt_buf.getvalue(),
-        file_name=st.session_state.out_name,
-        mime="text/plain",
-    )
+        txt_buf = io.BytesIO(st.session_state.report_text.encode("utf-8"))
+        st.download_button(
+            "리포트 다운로드(.txt)", data=txt_buf.getvalue(),
+            file_name=st.session_state.out_name, mime="text/plain",
+            use_container_width=True
+        )
+        st.markdown("<div class='small'>※ 교육·임상 보조용 요약 리포트입니다.</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)

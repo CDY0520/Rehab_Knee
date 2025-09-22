@@ -123,32 +123,45 @@ def plot_timeline(t_ms, heel_y, toe_y, knee_ang_n, gt_df, side, save_path):
     plt.figure(figsize=(14, 4.2))
     ax = plt.gca()
 
-    ax.plot(t_ms, heel_y,      label="Heel_y",            lw=1.2)
-    ax.plot(t_ms, toe_y,       label="Toe_y",             lw=1.2)
-    ax.plot(t_ms, knee_ang_n,  label="Knee angle",lw=1.2)
+    ax.plot(t_ms, heel_y,      label="Heel_y",      lw=1.2)
+    ax.plot(t_ms, toe_y,       label="Toe_y",       lw=1.2)
+    ax.plot(t_ms, knee_ang_n,  label="Knee angle",  lw=1.2)
 
     ax.set_title(f"Timeline overlay ({'LEFT' if side=='L' else 'RIGHT'})")
     ax.set_xlabel("time (ms)")
     ax.set_ylabel("normalized scale (0-1)")
     ax.grid(True, alpha=0.2)
 
+    # ---- 축 범위 계산(데이터 기준) + 반전은 ylim을 역순으로 설정
+    y_min = float(np.nanmin([np.nanmin(heel_y), np.nanmin(toe_y), np.nanmin(knee_ang_n)]))
+    y_max = float(np.nanmax([np.nanmax(heel_y), np.nanmax(toe_y), np.nanmax(knee_ang_n)]))
+    pad   = 0.06  # 여백
+    y0    = y_min - 0.05  # GT 마커 위치(데이터 아래쪽)
+
+    # 반전: 위=0.0, 아래=1.0이 되도록 ylimit을 "큰 값, 작은 값" 순으로 설정
+    ax.set_ylim(y_max + pad, y_min - pad)
+
     # GT 마커
     if gt_df is not None and len(gt_df) > 0:
-        ymin = np.nanmin([np.nanmin(heel_y), np.nanmin(toe_y), np.nanmin(knee_ang_n)])
-        y0 = ymin - 0.05
+        # 현재 축 범위 가져오기 (반전된 상태)
+        cur_lo, cur_hi = ax.get_ylim()
+
+        # y0 = 축 하단 + 약간의 여백
+        y0 = cur_lo + (cur_hi - cur_lo) * 0.05
+
         first = True
         for t, lab in zip(gt_df["time_ms"].values, gt_df["event"].str.upper().values):
             if first:
-                ax.scatter([t], [y0], s=36, c="tab:blue", marker="o", zorder=6, label="GT")
+                ax.scatter([t], [y0], s=40, c="tab:blue", marker="o",
+                           zorder=6, label="GT")
                 first = False
             else:
-                ax.scatter([t], [y0], s=36, c="tab:blue", marker="o", zorder=6)
-            ax.text(t, y0 - 0.03, lab, fontsize=9, ha="center", color="tab:red", zorder=6)
+                ax.scatter([t], [y0], s=40, c="tab:blue", marker="o", zorder=6)
 
-        # y축 하한 조정
-        cur_lo, cur_hi = ax.get_ylim()
-        if cur_lo > y0 - 0.06:
-            ax.set_ylim(y0 - 0.06, cur_hi)
+            # 이벤트 라벨은 마커 바로 아래쪽에
+            ax.text(t, y0 + (cur_hi - cur_lo) * 0.03, lab,
+                    fontsize=9, ha="center", va="bottom",
+                    color="tab:red", zorder=6)
 
     ax.legend(loc="upper right", ncol=4, fontsize=9, frameon=True)
     plt.tight_layout()
@@ -156,6 +169,7 @@ def plot_timeline(t_ms, heel_y, toe_y, knee_ang_n, gt_df, side, save_path):
     plt.savefig(save_path, dpi=200, bbox_inches="tight")
     plt.close()
     return save_path
+
 
 # 7) 메인 실행(main)
 def main():
