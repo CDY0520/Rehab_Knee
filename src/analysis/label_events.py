@@ -1,16 +1,20 @@
 """
 파일명: src/analysis/label_events.py
+
 설명:
   - 보행(Gait)과 STS 이벤트를 한 스크립트에서 수동 라벨링한다.
   - Gait: HS, TO, MS, GENU_RECURVATUM
   - STS : seat_off(SO), full_stand(FS)  ※ STS는 사이드 'C'로 저장
   - 저장 형식(csv): video_id,side,event,time_ms,frame  → results/gt/{video_id}_{side}.csv
+
 사용법:
   python src/analysis/label_events.py
+
 단축키:
   [공통]  j/J/k/K = 프레임 -1/-5/+1/+5,  u = 되돌리기,  s = 저장,  q/Esc = 종료,  z = 모드(Gait/STS) 토글
   [Gait]  1=L, 2=R,  h=HS,  t=TO,  m=MS,  g=GENU_RECURVATUM
   [STS ]  o=Seat-off,  f=Full-stand   (사이드는 자동으로 'C')
+
 블록 구성:
   0) import·경로 설정 및 영상 매핑
   1) 라벨 구조·유틸(시간 환산, 저장)
@@ -24,7 +28,7 @@ from pathlib import Path
 # 0) 경로·영상 매핑 ------------------------------------------------------------
 VIDEO_MAP = {
     "normal":   "data/samples/sample_walk_normal.mp4",
-    "hyperext": "data/samples/sample_walk3.mp4", # 루프본(과신전)
+    "hyperext": "data/samples/sample_walk_hyper.mp4", # 루프본(과신전)
 }
 OUT_DIR = Path("results/gt"); OUT_DIR.mkdir(parents=True, exist_ok=True)
 

@@ -86,90 +86,88 @@ def load_gt_csv(path_csv):
     return out
 
 # 5) 시계열 추출 함수(extract_series)
-def extract_series(lm_x, lm_y, valid, side="L", normalize=True):
+def extract_series(lm_x, lm_y, valid, side="L", normalize_knee=False):
     s = side.upper()
-    i_heel = IDX[f"{s}_HEEL"]
-    i_toe  = IDX[f"{s}_TOE"]
-    i_knee = IDX[f"{s}_KNEE"]
-    i_hip  = IDX[f"{s}_HIP"]
-    i_ank  = IDX[f"{s}_ANK"]
+    i_heel = IDX[f"{s}_HEEL"]; i_toe  = IDX[f"{s}_TOE"]
+    i_knee = IDX[f"{s}_KNEE"]; i_hip  = IDX[f"{s}_HIP"]; i_ank = IDX[f"{s}_ANK"]
 
-    heel_y = lm_y[:, i_heel].copy()
-    toe_y  = lm_y[:, i_toe ].copy()
+    heel_y = lm_y[:, i_heel].astype(float).copy()
+    toe_y  = lm_y[:, i_toe ].astype(float).copy()
 
-    hip  = np.stack([lm_x[:, i_hip],  lm_y[:, i_hip]], axis=1)
-    knee = np.stack([lm_x[:, i_knee], lm_y[:, i_knee]], axis=1)
-    ank  = np.stack([lm_x[:, i_ank],  lm_y[:, i_ank]], axis=1)
-    knee_angle = angle_abc(hip, knee, ank)
+    hip  = np.stack([lm_x[:, i_hip],  lm_y[:, i_hip]],  axis=1).astype(float)
+    knee = np.stack([lm_x[:, i_knee], lm_y[:, i_knee]], axis=1).astype(float)
+    ank  = np.stack([lm_x[:, i_ank],  lm_y[:, i_ank]],  axis=1).astype(float)
+    knee_angle_deg = angle_abc(hip, knee, ank)  # 도 단위
 
     # invalid 프레임 NaN
-    for arr in (heel_y, toe_y, knee_angle):
+    for arr in (heel_y, toe_y, knee_angle_deg):
         arr[~valid] = np.nan
 
-    if not normalize:
-        return heel_y, toe_y, knee_angle
+    if not normalize_knee:
+        return heel_y, toe_y, knee_angle_deg
 
-    def norm01(a):
-        lo, hi = np.nanpercentile(a, 1), np.nanpercentile(a, 99)
-        if hi - lo < 1e-6:
-            return np.zeros_like(a)
-        return (a - lo) / (hi - lo)
+    # 필요 시 각도만 0-1 정규화 옵션 유지
+    lo, hi = np.nanpercentile(knee_angle_deg, 1), np.nanpercentile(knee_angle_deg, 99)
+    knee_n = np.zeros_like(knee_angle_deg) if hi - lo < 1e-6 else (knee_angle_deg - lo) / (hi - lo)
+    return heel_y, toe_y, knee_n
 
-    return heel_y, toe_y, norm01(knee_angle)
-
-# 6) 플롯 함수(plot_timeline)
-def plot_timeline(t_ms, heel_y, toe_y, knee_ang_n, gt_df, side, save_path):
+# 6) 플롯 함수(plot_timeline) - 오른쪽 y축에 무릎 각도(도) 표시
+def plot_timeline(t_ms, heel_y, toe_y, knee_ang_deg, gt_df, side, save_path):
     """타임라인 플롯을 저장하고 경로를 반환"""
-    plt.figure(figsize=(14, 4.2))
+    plt.figure(figsize=(14, 4.6))
     ax = plt.gca()
 
-    ax.plot(t_ms, heel_y,      label="Heel_y",      lw=1.2)
-    ax.plot(t_ms, toe_y,       label="Toe_y",       lw=1.2)
-    ax.plot(t_ms, knee_ang_n,  label="Knee angle",  lw=1.2)
+    # 왼쪽 축: y좌표 시계열
+    ln1, = ax.plot(t_ms, heel_y, label="Heel_y", lw=1.2)
+    ln2, = ax.plot(t_ms, toe_y,  label="Toe_y",  lw=1.2)
 
     ax.set_title(f"Timeline overlay ({'LEFT' if side=='L' else 'RIGHT'})")
     ax.set_xlabel("time (ms)")
-    ax.set_ylabel("normalized scale (0-1)")
-    ax.grid(True, alpha=0.2)
+    ax.set_ylabel("y-coordinate")
+    ax.grid(True, alpha=0.25)
 
-    # ---- 축 범위 계산(데이터 기준) + 반전은 ylim을 역순으로 설정
-    y_min = float(np.nanmin([np.nanmin(heel_y), np.nanmin(toe_y), np.nanmin(knee_ang_n)]))
-    y_max = float(np.nanmax([np.nanmax(heel_y), np.nanmax(toe_y), np.nanmax(knee_ang_n)]))
-    pad   = 0.06  # 여백
-    y0    = y_min - 0.05  # GT 마커 위치(데이터 아래쪽)
+    # 왼쪽 축 범위 고정: 아래=1.0, 위=0.0
+    ax.set_ylim(1.0, 0.0)
 
-    # 반전: 위=0.0, 아래=1.0이 되도록 ylimit을 "큰 값, 작은 값" 순으로 설정
-    ax.set_ylim(y_max + pad, y_min - pad)
+    # 오른쪽 축: 무릎 각도(도)
+    ax2 = ax.twinx()
+    ln3, = ax2.plot(t_ms, knee_ang_deg, label="Knee angle (deg)",
+                    lw=1.6, linestyle="-", color="green")
+    ax2.set_ylabel("Knee angle (deg)")
 
-    # GT 마커
+    # 각도 축 자동 범위(과도한 아웃라이어 방지용 백분위 기반)
+    k_lo = np.nanpercentile(knee_ang_deg, 1)
+    k_hi = np.nanpercentile(knee_ang_deg, 99)
+    if np.isfinite(k_lo) and np.isfinite(k_hi) and k_hi - k_lo > 1e-3:
+        ax2.set_ylim(k_lo - 3, k_hi + 3)
+
+    # GT 마커는 왼쪽 축 기준으로 표시
+    sc_gt = None
     if gt_df is not None and len(gt_df) > 0:
-        # 현재 축 범위 가져오기 (반전된 상태)
         cur_lo, cur_hi = ax.get_ylim()
-
-        # y0 = 축 하단 + 약간의 여백
         y0 = cur_lo + (cur_hi - cur_lo) * 0.05
-
         first = True
         for t, lab in zip(gt_df["time_ms"].values, gt_df["event"].str.upper().values):
             if first:
-                ax.scatter([t], [y0], s=40, c="tab:blue", marker="o",
-                           zorder=6, label="GT")
+                sc_gt = ax.scatter([t], [y0], s=40, c="tab:blue", marker="o",
+                                   zorder=6, label="GT")
                 first = False
             else:
                 ax.scatter([t], [y0], s=40, c="tab:blue", marker="o", zorder=6)
-
-            # 이벤트 라벨은 마커 바로 아래쪽에
             ax.text(t, y0 + (cur_hi - cur_lo) * 0.03, lab,
                     fontsize=9, ha="center", va="bottom",
                     color="tab:red", zorder=6)
 
-    ax.legend(loc="upper right", ncol=4, fontsize=9, frameon=True)
+    # 범례 결합
+    handles = [ln1, ln2, ln3] + ([sc_gt] if sc_gt is not None else [])
+    labels = [h.get_label() for h in handles]
+    ax.legend(handles, labels, loc="upper right", ncol=len(handles), fontsize=9, frameon=True)
+
     plt.tight_layout()
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.savefig(save_path, dpi=200, bbox_inches="tight")
     plt.close()
     return save_path
-
 
 # 7) 메인 실행(main)
 def main():
@@ -188,15 +186,15 @@ def main():
     print(f"[info] GT rows: {0 if gt_df is None else len(gt_df)}")
 
     # 시계열
-    heel_y, toe_y, knee_ang_n = extract_series(lm_x, lm_y, valid, side=args.side, normalize=True)
+    heel_y, toe_y, knee_ang = extract_series(lm_x, lm_y, valid, side=args.side, normalize_knee=False)
 
     # 저장 경로
     base = os.path.splitext(os.path.basename(args.npz))[0]
     os.makedirs(args.outdir, exist_ok=True)
     save_path = os.path.join(args.outdir, f"{base}_{args.side}_timeline.png")
 
-    # 플롯 저장
-    saved = plot_timeline(t_ms, heel_y, toe_y, knee_ang_n, gt_df, args.side, save_path)
+    # 플롯 저장 (보조 y축 포함)
+    saved = plot_timeline(t_ms, heel_y, toe_y, knee_ang, gt_df, args.side, save_path)
     print(f"[saved] {saved}")
 
 if __name__ == "__main__":
