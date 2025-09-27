@@ -1,20 +1,16 @@
+# -*- coding: utf-8 -*-
 """
 파일명: src/events.py
 
 설명:
   - Mediapipe Pose 시계열(.npz)에서 보행(Gait) 이벤트/지표 계산.
-  - HS/TO/MS 규칙:
-      · diff_ht(t)=heel_y−toe_y 파형으로 각 사이드의 한 주기 내
-        MS(플랫 구간 중앙) → TO(diff_ht 음의 피크) → HS(diff_ht 양의 피크) 검출.
-      · diff_ht 전체 진폭이 매우 작으면(마비·플랫풋) 해당 사이드 이벤트 0건 처리.
-  - 산출:
-      · Gait: 이벤트(HS, TO, MS, GENU_RECURVATUM) + 지표(무릎 최대/최소 내부각, near-extension 비율/최대 지속,
-        stiff-knee 개수)
-  - 저장: JSON 요약, 타임라인 CSV, 지표 CSV, 스텝/스트라이드 CSV (results/reports)
+  - HS/TO/MS: diff_ht(t)=heel_y−toe_y 기반 완화 규칙.
+  - GR(과신전): MS±창 내에서 (무릎 내부각 ≥ gr_angle_inner_deg) ∧ (knee_x 부호전환 구간 존재).
+  - 산출: 이벤트(HS, TO, MS, GENU_RECURVATUM) + 지표(무릎 최대/최소 내부각, near-extension 비율/최대 지속, stiff-knee 개수)
+  - 저장: JSON/CSV
 
 입력: pose npz {lm_x,lm_y,lm_v,t_ms,valid,meta,...}
-
-주의: y축은 이미지 좌표계(아래가 +). diff_ht는 발 피치의 대용 신호. 노이즈 크면 ma_win/prom_rel 조정.
+주의: y축은 이미지 좌표계(아래가 +).
 """
 
 from __future__ import annotations
@@ -44,30 +40,37 @@ L_HEEL, R_HEEL = 29, 30  # 뒤꿈치
 class GaitParams:
     # 핵심 평활·임계
     ma_win: int = 7                   # 이동평균 창
-    ms_zero_eps_rel: float = 0.005    # MS: |heel−toe|≤eps 비율
-    min_gap_ms: int = 150             # 이벤트 간 최소 간격
+    ms_zero_eps_rel: float = 0.02     # MS: |heel−toe|≤eps 비율
+    min_gap_ms: int = 120             # 이벤트 간 최소 간격
     min_diffht_amp_rel: float = 0.003 # diff_ht 진폭 없을 때 스킵
 
-    # 과신전 판정에 쓰는 최소 plateau 길이
+    # near-extension
     ms_plateau_min_ms: float = 80.0
     near_ext_flex_deg: float = 8.0
-
-    # 참고: ms_border_deg, ms_def_deg를 쓰면 여기로 이동
     ms_border_deg: float = 178.0
     ms_def_deg: float = 180.0
 
+    # ─ GR(각도+부호전환) 규칙 ─
+    gr_angle_inner_deg: float = 175.0   # 내부각 임계
+    gr_ms_window_ms: float = 400.0      # MS 주변 창(±)
+    snap_min_dur_ms: float = 40.0       # 부호전환 연속 최소 지속(ms)
+    flip_min_disp: float = 0.01         # 부호전환 구간 누적 |dx| 최소(노이즈 컷)
 
 # ───────────────────────────────
 # IO / math utils
 # ───────────────────────────────
 def load_npz(path: str | Path):
     d = np.load(path, allow_pickle=True)
-    meta_raw = d["meta"]
-    meta = json.loads(str(meta_raw.item() if hasattr(meta_raw, "item") else meta_raw))
+    meta_raw = d["meta"] if "meta" in d.files else "{}"
+    try:
+        meta = json.loads(str(meta_raw.item() if hasattr(meta_raw, "item") else meta_raw))
+    except Exception:
+        meta = {}
     def opt(name): return d[name] if name in d.files else None
     return {
-        "lm_x": d["lm_x"], "lm_y": d["lm_y"], "lm_v": d["lm_v"],
-        "t_ms": d["t_ms"], "valid": d["valid"].astype(bool),
+        "lm_x": d["lm_x"], "lm_y": d["lm_y"], "lm_v": opt("lm_v"),
+        "t_ms": d["t_ms"] if "t_ms" in d.files else np.arange(d["lm_x"].shape[0]) * 1000/30.0,
+        "valid": d["valid"].astype(bool) if "valid" in d.files else np.ones(d["lm_x"].shape[0], bool),
         "vis_mean": opt("vis_mean"), "n_visible": opt("n_visible"),
         "bbox_ratio": opt("bbox_ratio"), "jitter": opt("jitter"),
         "quality_ok": opt("quality_ok"), "meta": meta,
@@ -76,38 +79,19 @@ def load_npz(path: str | Path):
 def smooth1d(x: np.ndarray, win: int):
     if win <= 1: return x
     k = np.ones(win, dtype=float) / win
-    return np.convolve(x, k, mode="same")
-
-def diff(x: np.ndarray, dt: float):
-    dx = np.zeros_like(x, dtype=float)
-    if len(x) > 1:
-        dx[1:-1] = (x[2:] - x[:-2]) / (2 * dt)
-        dx[0] = (x[1] - x[0]) / dt
-        dx[-1] = (x[-1] - x[-2]) / dt
-    return dx
-
-def vel(sig: np.ndarray, fps: float): return np.gradient(sig) * fps
+    return np.convolve(x.astype(float), k, mode="same")
 
 def _export_json(obj: dict, out: str | Path):
-    """NumPy/판다스 타입을 파이썬 기본 타입으로 변환해 JSON 저장"""
     out = Path(out); out.parent.mkdir(parents=True, exist_ok=True)
-
     def _to_py(x):
         import numpy as _np
-        if isinstance(x, (_np.integer,)):
-            return int(x)
-        if isinstance(x, (_np.floating,)):
-            return float(x)
-        if isinstance(x, (_np.bool_,)):
-            return bool(x)
-        if isinstance(x, (_np.ndarray,)):
-            return _np.nan_to_num(x, nan=None).tolist()
-        if isinstance(x, dict):
-            return {k: _to_py(v) for k, v in x.items()}
-        if isinstance(x, (list, tuple)):
-            return [_to_py(v) for v in x]
+        if isinstance(x, (_np.integer,)): return int(x)
+        if isinstance(x, (_np.floating,)): return float(x)
+        if isinstance(x, (_np.bool_,)): return bool(x)
+        if isinstance(x, (_np.ndarray,)): return _np.nan_to_num(x, nan=None).tolist()
+        if isinstance(x, dict): return {k: _to_py(v) for k, v in x.items()}
+        if isinstance(x, (list, tuple)): return [_to_py(v) for v in x]
         return x
-
     with out.open("w", encoding="utf-8") as f:
         json.dump(_to_py(obj), f, ensure_ascii=False, indent=2)
 
@@ -115,12 +99,6 @@ def _export_csv(rows: list[dict], out: str | Path):
     if pd is None: return
     out = Path(out); out.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(out, index=False, encoding="utf-8-sig")
-
-def _robust_z(x: np.ndarray, eps: float = 1e-9):
-    x = np.asarray(x, dtype=float)
-    med = np.nanmedian(x)
-    mad = np.nanmedian(np.abs(x - med)) + eps
-    return 0.6745 * (x - med) / mad
 
 # ───────────────────────────────
 # Geometry: knee angle
@@ -139,26 +117,12 @@ def _knee_flexion_deg_from_inner(inner_deg: np.ndarray) -> np.ndarray:
 # ───────────────────────────────
 # diff_ht 기반 로컬 피크/골짜기
 # ───────────────────────────────
-def _local_extrema_with_prominence(x: np.ndarray, kind: str, prom_min: float):
-    idx = []
-    n = len(x)
-    for i in range(1, n-1):
-        if not np.isfinite(x[i-1:i+2]).all(): continue
-        if kind == "max":
-            if x[i] >= x[i-1] and x[i] >= x[i+1]:
-                left = np.max(x[:i]) if i > 0 else x[i]
-                right = np.max(x[i+1:]) if i < n-1 else x[i]
-                base = min(left, right)
-                prom = x[i] - base
-                if prom >= prom_min: idx.append(i)
-        else:
-            if x[i] <= x[i-1] and x[i] <= x[i+1]:
-                left = np.min(x[:i]) if i > 0 else x[i]
-                right = np.min(x[i+1:]) if i < n-1 else x[i]
-                base = max(left, right)
-                prom = base - x[i]
-                if prom >= prom_min: idx.append(i)
-    return idx
+def _local_extrema_simple(x: np.ndarray, kind: str):
+    if len(x) < 3: return np.array([], int)
+    if kind == "max":
+        return np.where((x[1:-1] >= x[:-2]) & (x[1:-1] >= x[2:]))[0] + 1
+    else:
+        return np.where((x[1:-1] <= x[:-2]) & (x[1:-1] <= x[2:]))[0] + 1
 
 # ───────────────────────────────
 # 새 규칙: MS→TO→HS (diff_ht + 무릎각)
@@ -168,43 +132,26 @@ def _hs_to_ms_single_side_with_knee(
     heel_i: int, toe_i: int, hip_i: int,
     knee_inner: np.ndarray, params: GaitParams
 ):
-    """
-    반환: (hs_idx, to_idx, ms_idx)
-    규칙(완화판)
-      - MS: |diff_ht|<=eps 이면서 무릎 국소 최대(없으면 diff==0 교차 근방 최대)
-      - TO: MS 이후 diff_ht<0 구간에서 무릎 최저
-      - HS: TO 이후 diff_ht>0 구간에서 무릎 최고
-    """
     heel = smooth1d(lm_y[:, heel_i].astype(float), max(3, params.ma_win))
     toe  = smooth1d(lm_y[:, toe_i ].astype(float), max(3, params.ma_win))
     diff_ht = heel - toe
     knee = smooth1d(np.asarray(knee_inner, float), max(5, params.ma_win))
 
-    # 스케일·임계
     scale = np.nanmedian(np.abs(lm_y[:, hip_i] - lm_y[:, heel_i]))
     if not np.isfinite(scale) or scale <= 0:
         s2 = np.nanstd(diff_ht); scale = s2 if np.isfinite(s2) and s2>0 else 1.0
-    eps = max(0.5*params.ms_zero_eps_rel, params.ms_zero_eps_rel) * scale   # 살짝 완화
-    min_gap = int(params.min_gap_ms*0.7)  # 간격 완화
+    eps = max(0.5*params.ms_zero_eps_rel, params.ms_zero_eps_rel) * scale
+    min_gap = int(params.min_gap_ms*0.7)
     n = len(diff_ht)
     if n < 5: return [], [], []
 
-    # 부호
-    sign = np.sign(diff_ht)  # -1,0,1
-
-    # 간단 로컬 extremum
-    def lmax(x):
-        return np.where((x[1:-1] >= x[:-2]) & (x[1:-1] >= x[2:]))[0]+1
-    def lmin(x):
-        return np.where((x[1:-1] <= x[:-2]) & (x[1:-1] <= x[2:]))[0]+1
-
-    kmax = lmax(knee); kmin = lmin(knee)
-
-    # MS 후보: |diff|<=eps ∧ 무릎 최대. 없으면 0교차 근방 무릎 최대
+    sign = np.sign(diff_ht)
+    kmax = _local_extrema_simple(knee, "max")
+    # MS 후보
     ms_zone = np.where(np.isfinite(diff_ht) & (np.abs(diff_ht) <= eps))[0]
     ms_cands = sorted(set(ms_zone).intersection(set(kmax)))
     if not ms_cands:
-        zc = np.where(np.sign(diff_ht[:-1]) * np.sign(diff_ht[1:]) < 0)[0]  # 0 교차
+        zc = np.where(np.sign(diff_ht[:-1]) * np.sign(diff_ht[1:]) < 0)[0]
         for i in zc:
             a = max(0, i-5); b = min(n, i+6)
             j = a + int(np.nanargmax(knee[a:b]))
@@ -217,105 +164,137 @@ def _hs_to_ms_single_side_with_knee(
         s = max(1, s); e = min(n-1, e)
         if e <= s+1: return None
         if want_pos:
-            # HS: diff>0 구간의 무릎 최대
             mask = np.where(sign[s:e] > 0)[0]
             if mask.size == 0: return None
             idx = s + mask
-            j = idx[np.nanargmax(knee[idx])]
-            return int(j)
+            return int(idx[np.nanargmax(knee[idx])])
         else:
-            # TO: diff<0 구간의 무릎 최소
             mask = np.where(sign[s:e] < 0)[0]
             if mask.size == 0: return None
             idx = s + mask
-            j = idx[np.nanargmin(knee[idx])]
-            return int(j)
+            return int(idx[np.nanargmin(knee[idx])])
 
     hs_idx, to_idx, ms_idx = [], [], []
     for m in ms_cands:
-        # MS는 무릎 최대 조건 유지. 아니면 근방 재보정
         if m not in kmax:
             a = max(0, m-5); b = min(n, m+6)
             m = a + int(np.nanargmax(knee[a:b]))
-
-        j = next_in_window(t_ms[m], want_pos=False)   # TO
+        j = next_in_window(t_ms[m], want_pos=False)
         if j is None: continue
-        k = next_in_window(t_ms[j], want_pos=True)    # HS
+        k = next_in_window(t_ms[j], want_pos=True)
         if k is None: continue
-
         ms_idx.append(m); to_idx.append(j); hs_idx.append(k)
 
     L = min(len(hs_idx), len(to_idx), len(ms_idx))
     return hs_idx[:L], to_idx[:L], ms_idx[:L]
 
 # ───────────────────────────────
-# 과신전(Hyperextension) 검출: MS기간 내 '최대 신전 유지'
+# GR 부호전환 기반 유틸
 # ───────────────────────────────
-def detect_hyperextension_ms(
-    diff_ht: np.ndarray,           # heel_y - toe_y
-    knee_inner: np.ndarray,        # 무릎 내부각(180=완전 신전)
-    t_ms: np.ndarray,
-    ms_idx: list[int],
-    eps_rel: float = 0.003,
-    band_deg: float = 1.5,
-    min_plateau_ms: float = 80.0,
-    win_ms: int = 200
-):
-    diff_ht = np.asarray(diff_ht, float)
-    knee    = np.asarray(knee_inner, float)
-    t_ms    = np.asarray(t_ms, float)
-    n = len(diff_ht)
-    if n == 0 or len(ms_idx) == 0:
-        return []
+def _dominant_sign(dx: np.ndarray) -> int:
+    """dx의 지배 부호(+1 또는 -1). 0 근처는 제외하고 다수결."""
+    x = dx[np.isfinite(dx)]
+    x = x[np.abs(x) > 1e-6]
+    if x.size == 0:
+        return 0
+    pos = np.sum(x > 0)
+    neg = np.sum(x < 0)
+    if pos == neg: return 0
+    return 1 if pos > neg else -1
 
-    finite = np.isfinite(diff_ht)
-    amp95  = np.nanpercentile(np.abs(diff_ht[finite]), 95) if np.any(finite) else 1.0
-    eps = eps_rel * max(amp95, 1e-6)
+def _sign_flip_spans(knee_x: np.ndarray, t_ms: np.ndarray,
+                     min_dur_ms: float,
+                     min_disp: float,
+                     smooth_win: int = 5):
+    """
+    knee_x 차분 dx의 지배부호와 반대 부호가 연속되는 '부호전환' 구간 반환.
+    반환: list[[t_start, t_end, t_mid, disp]]
+    """
+    x = knee_x.astype(float).copy()
+    if smooth_win and smooth_win > 1:
+        k = np.ones(smooth_win, float)/smooth_win
+        x = np.convolve(x, k, mode="same")
+    dx = np.diff(x, prepend=x[0])
+    dom = _dominant_sign(dx)
+    if dom == 0:
+        return []  # 지배 부호 결정 불가(정체 등)
 
-    out = []
-    for m in ms_idx:
-        t0 = t_ms[m] - win_ms
-        t1 = t_ms[m] + win_ms
-        a = int(np.searchsorted(t_ms, t0, 'left'))
-        b = int(np.searchsorted(t_ms, t1, 'right'))
-        a = max(0, a); b = min(n, b)
-        if b - a < 3:
-            out.append({'ms_idx': m, 'ms_start': int(t_ms[a]), 'ms_end': int(t_ms[b-1]),
-                        'knee_max': float('nan'), 'plateau_ms': 0.0, 'is_hyper': False})
-            continue
+    opp = -dom
+    mask = np.sign(dx) == opp
 
-        ms_mask = np.isfinite(diff_ht[a:b]) & (np.abs(diff_ht[a:b]) <= eps) & np.isfinite(knee[a:b])
-        if not np.any(ms_mask):
-            out.append({'ms_idx': m, 'ms_start': int(t_ms[a]), 'ms_end': int(t_ms[b-1]),
-                        'knee_max': float('nan'), 'plateau_ms': 0.0, 'is_hyper': False})
-            continue
-
-        idx_local = np.arange(a, b)[ms_mask]
-        knee_seg  = knee[idx_local]
-        t_seg     = t_ms[idx_local]
-
-        kmax = float(np.nanmax(knee_seg))
-        keep = knee_seg >= (kmax - band_deg)
-        dt = np.diff(t_seg, prepend=t_seg[0])
-        plateau_ms = float(np.sum(dt[keep]))
-
-        out.append({
-            'ms_idx': int(m),
-            'ms_start': int(t_seg[0]),
-            'ms_end': int(t_seg[-1]),
-            'knee_max': float(kmax),
-            'plateau_ms': plateau_ms,
-            'is_hyper': plateau_ms >= float(min_plateau_ms),
-        })
-    return out
+    spans = []
+    n = len(dx); i = 0
+    while i < n:
+        if not mask[i]:
+            i += 1; continue
+        j = i
+        while j < n and mask[j]:
+            j += 1
+        t0 = float(t_ms[max(i-1, 0)])
+        t1 = float(t_ms[min(j, n-1)])
+        if (t1 - t0) >= min_dur_ms:
+            disp = float(np.nansum(np.abs(dx[i:j])))
+            if disp >= min_disp:
+                spans.append([t0, t1, (t0+t1)/2.0, disp])
+        i = j
+    return spans
 
 # ───────────────────────────────
-# GENU_RECURVATUM detector stub (disabled)
+# GR: knee_x 부호전환 + 각도 임계
 # ───────────────────────────────
 def _detect_genu_recurvatum_per_side(
-    knee_flex_deg, hs_list, to_list, t_ms, fps, params
+    knee_inner_deg: np.ndarray,
+    knee_x: np.ndarray,
+    t_ms: np.ndarray,
+    ms_idx: list[int],
+    params: GaitParams
 ):
-    return []
+    """
+    GR = (MS±window 내) AND (무릎 내부각 최대 ≥ gr_angle_inner_deg) AND (knee_x 부호전환 구간 존재)
+    방향 무관.
+    """
+    out = []
+    if len(ms_idx) == 0: return out
+
+    k_in = np.asarray(knee_inner_deg, float)
+    x    = np.asarray(knee_x, float)
+    t    = np.asarray(t_ms, float)
+
+    # 전 구간 부호전환 후보
+    flip_spans = _sign_flip_spans(
+        x, t,
+        min_dur_ms=max(20.0, float(params.snap_min_dur_ms)),
+        min_disp=float(params.flip_min_disp),
+        smooth_win=5
+    )
+
+    for m in ms_idx:
+        t0 = t[m] - params.gr_ms_window_ms
+        t1 = t[m] + params.gr_ms_window_ms
+        a = int(np.searchsorted(t, t0, 'left'))
+        b = int(np.searchsorted(t, t1, 'right'))
+        a = max(0, a); b = min(len(t), b)
+        if b - a < 3: continue
+
+        # 각도 조건
+        if np.nanmax(k_in[a:b]) < params.gr_angle_inner_deg:
+            continue
+
+        # 윈도우 내 부호전환 겹침 여부
+        cand = [s for s in flip_spans if not (s[1] < t0 or s[0] > t1)]
+        if not cand:
+            continue
+
+        s0 = sorted(cand, key=lambda z: z[2])[0]
+        out.append({
+            "ms_idx": int(m),
+            "time_ms": int(round(s0[2])),
+            "span_start_ms": int(round(s0[0])),
+            "span_end_ms": int(round(s0[1])),
+            "flip_disp": float(s0[3]),
+            "angle_max_inner_ms_win": float(np.nanmax(k_in[a:b]))
+        })
+    return out
 
 # ───────────────────────────────
 # Stiff knee (TO 시점 내부각 기준)
@@ -328,7 +307,6 @@ def detect_stiff_knee_at_to(
 ):
     ki = np.asarray(knee_inner, float)
     t  = np.asarray(t_ms, float)
-
     out = []
     for j in to_idx:
         if not (0 <= j < len(ki)) or not np.isfinite(ki[j]):
@@ -349,8 +327,10 @@ def detect_stiff_knee_at_to(
 # ───────────────────────────────
 def _side_result(label: str, t_ms: np.ndarray,
                  hs_idx: list[int], to_idx: list[int], ms_idx: list[int],
-                 knee_inner_deg: np.ndarray, lm_y: np.ndarray, toe_i: int,
+                 knee_inner_deg: np.ndarray, knee_x: np.ndarray,
+                 lm_y: np.ndarray, toe_i: int,
                  params: GaitParams, fps: float) -> dict:
+
     knee_flex = _knee_flexion_deg_from_inner(knee_inner_deg)
     qmask = np.isfinite(knee_flex)
 
@@ -367,13 +347,13 @@ def _side_result(label: str, t_ms: np.ndarray,
         for g in np.split(near_idx, splits):
             longest = max(longest, int(t_ms[g[-1]] - t_ms[g[0]]))
 
-    # GR 후보(스텁)
-    gr = _detect_genu_recurvatum_per_side(
-        knee_flex_deg=knee_flex, hs_list=hs_idx, to_list=to_idx, t_ms=t_ms, fps=fps, params=params
+    # GR: 각도+부호전환 복합
+    gr_items = _detect_genu_recurvatum_per_side(
+        knee_inner_deg=knee_inner_deg, knee_x=knee_x, t_ms=t_ms, ms_idx=ms_idx, params=params
     )
-    gr_ms_all = sorted(set(int(e["time_ms"]) for e in gr)) if gr else []
+    gr_ms_all = [int(e["time_ms"]) for e in gr_items]
 
-    # Stiff-knee: TO 시점 내부각 기준
+    # Stiff-knee
     sk_items = detect_stiff_knee_at_to(knee_inner=knee_inner_deg, t_ms=t_ms, to_idx=to_idx, thresh_inner_deg=140.0)
     stiff_cnt = int(sum(1 for it in sk_items if it.get("stiff", False)))
 
@@ -392,10 +372,11 @@ def _side_result(label: str, t_ms: np.ndarray,
             "HS_ms": [int(t_ms[i]) for i in hs_idx],
             "TO_ms": [int(t_ms[i]) for i in to_idx],
             "MS_ms": [int(t_ms[i]) for i in ms_idx],
-            "GENU_RECURVATUM_ms": gr_ms_all,
+            "GENU_RECURVATUM_ms": sorted(gr_ms_all),
         },
         "metrics": metrics_core,
-        "stiff_knee_items": sk_items,   # 참고용
+        "stiff_knee_items": sk_items,
+        "gr_items": gr_items,  # 부호전환/각도 상세
     }
 
 # ───────────────────────────────
@@ -406,7 +387,6 @@ def detect_events_bilateral(npz_path: str, params: GaitParams | None = None) -> 
     D = load_npz(npz_path)
     lx, ly, t_ms = D["lm_x"], D["lm_y"], D["t_ms"]
     valid, meta = D["valid"], D["meta"]
-    vmean, bbr, qok = D["vis_mean"], D["bbox_ratio"], D["quality_ok"]
 
     # fps
     if len(t_ms) > 1:
@@ -416,9 +396,13 @@ def detect_events_bilateral(npz_path: str, params: GaitParams | None = None) -> 
         fps = float(meta.get("fps", 30))
 
     # 각도
-    yx = np.stack([ly, lx], axis=-1)
+    yx = np.stack([ly, lx], axis=-1)  # (y,x)
     knee_inner_L = _knee_angle_deg(yx, L_HIP, L_KNEE, L_ANKLE)
     knee_inner_R = _knee_angle_deg(yx, R_HIP, R_KNEE, R_ANKLE)
+
+    # 무릎 x좌표
+    knee_x_L = lx[:, L_KNEE].astype(float)
+    knee_x_R = lx[:, R_KNEE].astype(float)
 
     # HS/TO/MS
     hs_L, to_L, ms_L = _hs_to_ms_single_side_with_knee(
@@ -430,8 +414,8 @@ def detect_events_bilateral(npz_path: str, params: GaitParams | None = None) -> 
         knee_inner=knee_inner_R, params=params
     )
 
-    left_res  = _side_result("LEFT",  t_ms, hs_L, to_L, ms_L, knee_inner_L, ly, L_FOOT_INDEX, params, fps)
-    right_res = _side_result("RIGHT", t_ms, hs_R, to_R, ms_R, knee_inner_R, ly, R_FOOT_INDEX, params, fps)
+    left_res  = _side_result("LEFT",  t_ms, hs_L, to_L, ms_L, knee_inner_L, knee_x_L, ly, L_FOOT_INDEX, params, fps)
+    right_res = _side_result("RIGHT", t_ms, hs_R, to_R, ms_R, knee_inner_R, knee_x_R, ly, R_FOOT_INDEX, params, fps)
 
     return {
         "task": "gait",
@@ -471,19 +455,15 @@ def save_events_csv_metrics(result: dict, out_csv: str | Path):
         ev = side_res.get("events",  {})
         rows.append({
             "side": side,
-            # 이벤트 개수
             "hs_count": len(ev.get("HS_ms", [])),
             "to_count": len(ev.get("TO_ms", [])),
             "ms_count": len(ev.get("MS_ms", [])),
             "gr_count": len(ev.get("GENU_RECURVATUM_ms", [])),
             "stiff_count": m.get("stiff_knee_count"),
-            # 핵심 각도
             "knee_max_inner_deg": m.get("knee_max_inner_deg"),
             "knee_min_inner_deg": m.get("knee_min_inner_deg"),
-            # 참고 지표
             "near_ext_ratio_all": m.get("near_ext_ratio_all"),
             "near_ext_longest_ms": m.get("near_ext_longest_ms"),
-            # 타임스탬프 리스트
             "hs_ms_list": ";".join(str(x) for x in ev.get("HS_ms", [])),
             "to_ms_list": ";".join(str(x) for x in ev.get("TO_ms", [])),
             "ms_ms_list": ";".join(str(x) for x in ev.get("MS_ms", [])),
@@ -539,7 +519,7 @@ def save_strides_csv(result: dict, out_csv: str | Path):
     _export_csv(rows, out_csv)
 
 # ───────────────────────────────
-# Print summaries (요구 포맷)
+# Print summaries
 # ───────────────────────────────
 def _print_summary_gait(res: dict):
     for side in ["LEFT", "RIGHT"]:

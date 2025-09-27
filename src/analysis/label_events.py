@@ -28,7 +28,7 @@ from pathlib import Path
 # 0) 경로·영상 매핑 ------------------------------------------------------------
 VIDEO_MAP = {
     "normal":   "data/samples/sample_walk_normal.mp4",
-    "hyperext": "data/samples/sample_walk_hyper.mp4", # 루프본(과신전)
+    "hyperext": "data/samples/sample_walk_hyper.mp4",
 }
 OUT_DIR = Path("results/gt"); OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -118,7 +118,7 @@ def label_video(video_id: str):
 
         # 이벤트 기록
         elif mode == "gait" and k in [ord('h'), ord('t'), ord('m'), ord('g')]:
-            ev = {ord('h'):"HS", ord('t'):"TO", ord('m'):"MS", ord('g'):"HY.EXT."}[k]
+            ev = {ord('h'):"HS", ord('t'):"TO", ord('m'):"MS", ord('g'):"GR"}[k]
             t_ms = _ms_from_frame(cur, fps)
             marks.append({"side": side, "event": ev, "frame": cur, "time_ms": t_ms})
 
