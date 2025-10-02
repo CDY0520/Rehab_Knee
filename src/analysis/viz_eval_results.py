@@ -41,7 +41,7 @@ PRED_CSV_TPL = "pred_{vid}.csv"
 # video_id → npz 경로 매핑 (필요에 맞게 추가)
 NPZ_MAP = {
     "normal":   KEY_DIR / "sample_walk_normal.npz",
-    "hyperext": KEY_DIR / "sample_walk_hyper.npz",
+    "hyperext": KEY_DIR / "sample_walk3.npz",
 }
 
 # ───────────────────────────────

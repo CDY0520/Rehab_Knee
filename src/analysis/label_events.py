@@ -28,7 +28,7 @@ from pathlib import Path
 # 0) 경로·영상 매핑 ------------------------------------------------------------
 VIDEO_MAP = {
     "normal":   "data/samples/sample_walk_normal.mp4",
-    "hyperext": "data/samples/sample_walk_hyper.mp4",
+    "hyperext": "data/samples/sample_walk3.mp4",
 }
 OUT_DIR = Path("results/gt"); OUT_DIR.mkdir(parents=True, exist_ok=True)
 

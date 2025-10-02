@@ -9,6 +9,12 @@
   - 산출: 이벤트(HS, TO, MS, GENU_RECURVATUM) + 지표(무릎 최대/최소 내부각, near-extension 비율/최대 지속, stiff-knee 개수)
   - 저장: JSON/CSV
 
+사용법
+   # 기본 요약만 출력
+    python src/events.py --npz results/keypoints/sample_walk3.npz
+    # JSON과 CSV 저장
+    python src/events.py --npz results/keypoints/sample_walk.npz --save-json --save-csv
+
 입력: pose npz {lm_x,lm_y,lm_v,t_ms,valid,meta,...}
 주의: y축은 이미지 좌표계(아래가 +).
 """
@@ -161,29 +167,66 @@ def _hs_to_ms_single_side_with_knee(
     def next_in_window(start_ms, want_pos: bool, radius_ms: int = 800):
         s = int(np.searchsorted(t_ms, start_ms + min_gap, 'left'))
         e = int(np.searchsorted(t_ms, start_ms + radius_ms, 'right'))
-        s = max(1, s); e = min(n-1, e)
-        if e <= s+1: return None
+        s = max(1, s);
+        e = min(n - 1, e)
+        if e <= s + 1:
+            return None
+
         if want_pos:
+            # 양수 구간에서 무릎각 최대 지점
             mask = np.where(sign[s:e] > 0)[0]
-            if mask.size == 0: return None
+            if mask.size == 0:
+                return None
             idx = s + mask
-            return int(idx[np.nanargmax(knee[idx])])
+            rel = int(np.nanargmax(knee[idx]))
+            return int(idx[rel])
         else:
+            # 음수 구간에서 무릎각 최소 지점
             mask = np.where(sign[s:e] < 0)[0]
-            if mask.size == 0: return None
+            if mask.size == 0:
+                return None
             idx = s + mask
-            return int(idx[np.nanargmin(knee[idx])])
+            # NaN 방지용 유효값 필터
+            kseg = knee[idx]
+            fin = np.isfinite(kseg)
+            if not np.any(fin):
+                return None
+            rel = int(np.argmin(kseg[fin]))
+            return int(idx[fin][rel])
 
     hs_idx, to_idx, ms_idx = [], [], []
+
+    # ───────── MS→TO→HS 단일 사이클 강제 ─────────
+    # last_t 이후의 MS만 수용. 한 번 HS가 확정되면 그 전 구간의 MS 후보는 모두 폐기.
+    last_t = -1e18
     for m in ms_cands:
+        # HS 이후(min_gap 포함) 이전의 MS 후보는 건너뜀
+        if t_ms[m] < last_t + min_gap:
+            continue
+
+        # MS 위치 보정: 인근 최대 무릎각으로 스냅
         if m not in kmax:
             a = max(0, m-5); b = min(n, m+6)
             m = a + int(np.nanargmax(knee[a:b]))
+
+        # TO는 MS 이후, 음수 구간에서 선택
         j = next_in_window(t_ms[m], want_pos=False)
-        if j is None: continue
+        if j is None:
+            continue
+        # HS는 TO 이후, 양수 구간에서 선택
         k = next_in_window(t_ms[j], want_pos=True)
-        if k is None: continue
+        if k is None:
+            continue
+
+        # 시간 순서 보장
+        if not (m < j < k):
+            continue
+
+        # 한 사이클 확정
         ms_idx.append(m); to_idx.append(j); hs_idx.append(k)
+        # 다음 사이클은 확정된 HS 이후부터만 탐색
+        last_t = t_ms[k]
+    # ───────── 끝 ─────────
 
     L = min(len(hs_idx), len(to_idx), len(ms_idx))
     return hs_idx[:L], to_idx[:L], ms_idx[:L]

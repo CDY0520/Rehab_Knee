@@ -66,15 +66,18 @@ def infer_side_from_name(name: str) -> str | None:
 def pick_side_payload(res: dict, side_key: str):
     side = res.get(side_key, {}) or {}
     ev = side.get("events", {}) or {}
-    m_k = (side.get("metrics_knee_only")
+    # events.py 최신 스키마 우선 사용
+    m_k = (side.get("metrics")  # ← knee_max_inner_deg, stiff_knee_count, near_ext_*
+           or side.get("metrics_knee_only")
            or side.get("metrics_knee")
            or side.get("knee_metrics")
-           or (side.get("metrics", {}) if isinstance(side.get("metrics"), dict) else {})
            or {})
+    # 선택 지표는 현재 없음. 하위호환만 유지
     m_op = (side.get("metrics_optional")
             or side.get("optional_metrics")
             or {})
     return ev, m_k, m_op
+
 
 def lines_to_df(lines: list[str]) -> pd.DataFrame:
     return pd.DataFrame({"항목": lines})
@@ -83,7 +86,7 @@ def lines_to_df(lines: list[str]) -> pd.DataFrame:
 def 문구_보행_측면(side_label: str, ev: dict, m_k: dict, m_op: dict) -> list[str]:
     msgs = []
 
-    # 이벤트: HS/TO/MS
+    # 이벤트 수
     hs_n = len(ev.get("HS_ms", []))
     to_n = len(ev.get("TO_ms", []))
     ms_n = len(ev.get("MS_ms", []))
@@ -91,24 +94,26 @@ def 문구_보행_측면(side_label: str, ev: dict, m_k: dict, m_op: dict) -> li
     msgs.append(f"{side_label} 발끝 이탈(TO): {'발생 없음' if to_n==0 else f'{to_n}회 발생했습니다.'}")
     msgs.append(f"{side_label} 중간 디딤(MS): {'발생 없음' if ms_n==0 else f'{ms_n}회 확인되었습니다.'}")
 
-    # 무릎 각도/과신전
-    knee_max = float(m_k.get("knee_max_deg", np.nan)) if m_k else np.nan
-    hyper_ratio = float(m_k.get("hyperext_ratio_all", 0.0)) if m_k else 0.0
-    if np.isnan(knee_max):
+    # 무릎 각도 및 과신전
+    knee_max_inner = m_k.get("knee_max_inner_deg", np.nan)
+    gr_n = len(ev.get("GENU_RECURVATUM_ms", []))
+    if not np.isfinite(float(knee_max_inner)):
         msgs.append(f"{side_label} 무릎 각도(Knee angle): 데이터 없음")
     else:
-        if hyper_ratio > 0:
-            msgs.append(f"⚠️ {side_label} 무릎: 과신전이 관찰됩니다. (최대 {knee_max:.1f}°)")
+        if gr_n > 0:
+            msgs.append(f"⚠️ {side_label} 무릎: 과신전이 관찰됩니다. (최대 내부각 {float(knee_max_inner):.1f}°)")
         else:
-            msgs.append(f"{side_label} 무릎: 과신전은 관찰되지 않았습니다. (최대 {knee_max:.1f}°)")
+            msgs.append(f"{side_label} 무릎: 과신전은 관찰되지 않았습니다. (최대 내부각 {float(knee_max_inner):.1f}°)")
 
-    # 스윙 굴곡 부족
-    if m_op.get("stiff_knee_flag", False):
+    # 스윙 굴곡 부족(stiff-knee) — TO 시점 기준 검출 개수 사용
+    stiff_cnt = int(m_k.get("stiff_knee_count", 0))
+    if stiff_cnt > 0:
         msgs.append(f"⚠️ {side_label} 무릎: 다리를 앞으로 내딛을 때 무릎 굽힘이 부족합니다.")
     else:
         msgs.append(f"{side_label} 무릎: 다리를 앞으로 내딛을 때 굽힘이 적절합니다.")
 
     return msgs
+
 
 # ── 사이드바 네비 ──────────────────────────────────────────────────────────
 with st.sidebar:
