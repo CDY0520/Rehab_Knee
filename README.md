@@ -1,27 +1,68 @@
-# Rehab_Knee Project
-환자 보행 및 Sit-to-Stand(STS) 동작을 분석하고, 무릎 중심의 기능적 지표를 추출하는 프로젝트입니다.  
-Kinovea 등 무료 분석 도구를 통해 추출한 데이터를 기반으로, RAG + LLM을 활용한 요약/피드백 기능까지 제공합니다.
+# 신경계 재활 환자 특이 운동 패턴 자동 분석 파이프라인 개발
 
 ---
 
 # 프로젝트 개요
-목표: 신경계 손상 환자의 무릎 및 발목 움직임을 중심으로 보행/STS 기능 분석
-분석 도구: [Kinovea](https://www.kinovea.org) + Mediapipe 기반 포즈 추출
-AI 적용: RAG 기반 LLM으로 결과 요약 및 환자별 피드백 생성
-확장성: 환자 운동 모니터링 및 재활 지원 서비스로 발전 가능
+
+스마트폰으로 촬영한 보행(gait) 영상을 입력받아 Mediapipe Pose 기반으로 관절 좌표를 추출하고,
+무릎 중심 재활에 필요한 보행 이벤트 및 지표를 자동 분석하는 시스템이다.
+
+핵심 목표:
+무릎 과신전(Genū Recurvatum), Stiff-knee 이상 보행 패턴 자동 검출
+정량적 이벤트 추출: HS(뒤꿈치 닿음), TO(발끝 이탈), MS(중간 디딤)
+원격 재활 및 환자 자기 운동관리 지원
+
+---
+
+# 주요 기능
+
+Pose 기반 보행 이벤트 분석 (src/events.py)
+
+HS/TO/MS: heel_y − toe_y 차이 기반 규칙
+GR(Genū Recurvatum): MS ± window 내 무릎 내부각 ≥ 임계 + knee_x 부호전환 검출
+Stiff-knee: TO 시점 무릎 굴곡 부족
+
+---
+
+# 시각화
+
+타임라인 그래프: Heel/Toe Y좌표 + Knee angle + 이벤트 라벨
+
+---
+
+# Streamlit 대시보드
+
+📂 보행 영상 업로드 → 포즈 추출 & 이벤트 분석
+📊 이벤트 기반 동작 분석 결과 → 치료사 코멘트 입력
+📝 최종 리포트 다운로드
 
 ---
 
 # 디렉토리 구조
-```bash
+
 Rehab_Knee/
-│── data/               # 원천 데이터 (raw), 전처리 (processed), 샘플 (samples)
-│── results/            # 분석 결과 (json, figures, keypoints)
-│── src/                # 주요 Python 코드 (config, adapters 등)
-│── rag/                # RAG 인덱싱 및 프롬프트 템플릿
-│── notebooks/          # 실험용 Jupyter 노트북
-│── requirements.txt    # 패키지 의존성
-│── README.md           # 프로젝트 문서
+│
+├── app/
+│   ├── pages/
+│      ├── 01_영상업로드.py      # 보행 영상 업로드, 영상 품질검사
+│      ├── 02_동작분석.py        # 보행 이벤트 분석 + 리포트
+│       
+├── src/
+│   ├── qmetrics.py               # 영상 품질 지표 계산
+│   ├── events.py                 # 보행 이벤트/지표 검출
+│   ├── analysis/
+│   │   ├── timeline.py           # 보행 타임라인 시각화
+│   │   └── viz_eval_results.py   # 결과 시각화 및 평가
+│   └── pose_probe.py             # Mediapipe 포즈 추출 래퍼
+│
+├── results/
+│   ├── keypoints/                # npz 포즈 데이터
+│   ├── plots/                    # 분석 그래프
+│   └── reports/                  # 리포트(json/csv/txt)
+│
+├── requirements.txt
+└── README.md
+
 
 ---
 
