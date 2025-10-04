@@ -83,32 +83,23 @@ Rehab_Knee/
  - python src/events.py --npz results/keypoints/sample_walk_normal.npz --save-json --save-csv
 4) 대시보드 실행
  - streamlit run app/pages/01_영상업로드.py
- - streamlit run app/pages/02_.py
-
----
-
-# 사용 방법
-1) Kinovea에서 데이터 추출
- - Kinovea로 보행/STS 영상 불러오기
- - 마커링 후 CSV/좌표 데이터 Export
-2) 보행/STS 분석 실행
- - gait 분석: python -m src.gait_events --video data/samples/sample_walk.mp4 --side left --out results/sample_gait_left.json
- - STS 분석: python -m src.sts_events --video data/samples/sample_sts.mp4 --side left --out results/sample_sts_left.json
-3) RAG 인덱싱 + LLM 피드백
- - RAG 인덱싱 (결과 JSON을 검색 문서화): python -m rag.indexer --input results/
- - LLM 요약/피드백 생성: python -m rag.generate --input results/sample_sts_left.json
+ - streamlit run app/pages/02_동작분석.py
 
 ---
 
 # 결과 예시
-1) 출력 파일: results/ 폴더 내 JSON, 시각화 이미지 저장
-2) 예시 지표
- - 보행: 보폭, 보행주기, stance/swing 비율
- - STS: 일어서기 소요시간, 무릎 굴곡/신전 각도 변화
- - 무릎/발목: Kinovea 추출 기반 ROM, 기울기 등
-3)AI 피드백: RAG + LLM 기반 환자별 요약 및 피드백 리포트
+1) CLI 요약
+   [LEFT] HS n=4, TO n=4, MS n=4, GR n=3, SK n=4
+       knee_max_inner=179.6°, knee_min_inner=141.0°
+   [RIGHT] HS n=3, TO n=3, MS n=3, GR n=3, SK n=3
+       knee_max_inner=179.6°, knee_min_inner=156.8°
+2) streamlit 리포트
+   “왼쪽 뒤꿈치 닿음(HS): 4회 발생했습니다.”
+   “⚠️ 왼쪽 무릎: 과신전이 관찰됩니다.”
+   “⚠️ 왼쪽 무릎: 다리를 앞으로 내딛을 때 무릎 굽힘이 부족합니다.”
 
 ---
 
-# 라이선스
-MIT License
+# 참고
+MediaPipe Pose: https://developers.google.com/mediapipe/solutions/vision/pose
+임상 배경: 무릎 관절은 신경계 마비 환자 독립 보행 예측에 중요한 지표
