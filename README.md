@@ -51,8 +51,12 @@ Rehab_Knee/
 │   ├── qmetrics.py               # 영상 품질 지표 계산
 │   ├── events.py                 # 보행 이벤트/지표 검출
 │   ├── analysis/
-│   │   ├── timeline.py           # 보행 타임라인 시각화
-│   │   └── viz_eval_results.py   # 결과 시각화 및 평가
+│   │   ├── eval_events.py           # 라벨링 vs pred 비교 분석
+│   │   ├── label_events.py          # openCV, 보행 이벤트 수동 라벨링
+│   │   ├── run_gait_eval.py         # 보행 이벤트 pred
+│   │   ├── timeline.py              # npz 파일 활용해서 타임라인 그래프
+│   │   ├── timeline_knee_x.py       # 기존 타임라인 그래프 + knee x좌표 추가 그래프
+│   │   └── viz_eval_results.py      # pred 비교 분석 결과 시각화 및 평가
 │   └── pose_probe.py             # Mediapipe 포즈 추출 래퍼
 │
 ├── results/
@@ -63,18 +67,23 @@ Rehab_Knee/
 ├── requirements.txt
 └── README.md
 
-
 ---
 
-# 설치 방법
-1) 저장소 클론
+# 설치 및 실행
+
+1) 환경 세팅
  - git clone https://github.com/CDY0520/Rehab_Knee.git
  - cd Rehab_Knee
-2) 가상환경 생성 (선택)
  - python -m venv .venv
- - source .venv/bin/activate  # (Windows: .venv\Scripts\activate)
-3) 의존성 설치
+ - source .venv/bin/activate   # Windows: .venv\Scripts\activate
  - pip install -r requirements.txt
+2) Mediapipe 포즈 추출
+ - python src/pose_probe.py --video data/samples/sample_walk_normal.mp4 --out results/keypoints/sample_walk_normal.npz
+3) 보행 이벤트 분석 (CLI)
+ - python src/events.py --npz results/keypoints/sample_walk_normal.npz --save-json --save-csv
+4) 대시보드 실행
+ - streamlit run app/pages/01_영상업로드.py
+ - streamlit run app/pages/02_.py
 
 ---
 
