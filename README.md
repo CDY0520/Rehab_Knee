@@ -59,6 +59,7 @@ Stiff-knee: TO 시점 무릎 굴곡 부족
 
 # 디렉토리 구조
 
+'''
 Rehab_Knee/
 │
 ├── app/
@@ -85,6 +86,7 @@ Rehab_Knee/
 │
 ├── requirements.txt
 └── README.md
+'''
 
 ---
 
